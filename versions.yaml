@@ -107,7 +107,7 @@ assets:
     qemu-tdx-experimental:
       description: "QEMU with GPU+TDX support"
       url: "https://github.com/confidential-containers/qemu.git"
-      tag: "gpu-tdx-20250211"
+      tag: "gpu-tdx-20250714"
 
     stratovirt:
       description: "StratoVirt is an lightweight opensource VMM"

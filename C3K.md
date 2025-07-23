@@ -1,7 +1,6 @@
-# KubeCon.AI Staging Deployment
+# C3K.AI Staging Deployment
 
 Branch use to stage new development
-
 
 ## Helm Kata-Container deployment on K3S
 
