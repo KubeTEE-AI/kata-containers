@@ -815,7 +815,6 @@ dependencies = [
  "env_logger",
  "flate2",
  "fs2",
- "generic-array",
  "k8s-cri",
  "kata-agent-policy",
  "libz-ng-sys",
@@ -831,15 +830,12 @@ dependencies = [
  "serde_ignored",
  "serde_json",
  "serde_yaml",
- "sha2",
  "slog",
  "tar",
- "tarindex",
  "tempfile",
  "tokio",
  "tonic",
  "tower 0.4.13",
- "zerocopy",
 ]
 
 [[package]]
@@ -1674,9 +1670,9 @@ checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
 
 [[package]]
 name = "openssl"
-version = "0.10.72"
+version = "0.10.73"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fedfea7d58a1f73118430a55da6a286e7b044961736ce96a16a17068ea25e5da"
+checksum = "8505734d46c8ab1e19a1dce3aef597ad87dcb4c37e7188231769bd6bd51cebf8"
 dependencies = [
  "bitflags 2.4.1",
  "cfg-if",
@@ -1715,9 +1711,9 @@ dependencies = [
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.108"
+version = "0.9.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e145e1651e858e820e4860f7b9c5e169bc1d8ce1c86043be79fa7b7634821847"
+checksum = "90096e2e47630d78b7d1c20952dc621f957103f8bc2c8359ec81290d75238571"
 dependencies = [
  "cc",
  "libc",
@@ -2565,24 +2561,6 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
-]
-
-[[package]]
-name = "tarfs-defs"
-version = "0.1.0"
-source = "git+https://github.com/kata-containers/tardev-snapshotter?rev=06183a5#06183a5e2a83c3261740f4f0f6ce4aa16b14e436"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
-name = "tarindex"
-version = "0.1.0"
-source = "git+https://github.com/kata-containers/tardev-snapshotter?rev=06183a5#06183a5e2a83c3261740f4f0f6ce4aa16b14e436"
-dependencies = [
- "tar",
- "tarfs-defs",
- "zerocopy",
 ]
 
 [[package]]
@@ -3498,27 +3476,6 @@ dependencies = [
  "quote",
  "syn 2.0.104",
  "synstructure",
-]
-
-[[package]]
-name = "zerocopy"
-version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "854e949ac82d619ee9a14c66a1b674ac730422372ccb759ce0c39cabcf2bf8e6"
-dependencies = [
- "byteorder",
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "125139de3f6b9d625c39e2efdd73d41bdac468ccd556556440e322be0e1bbd91"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.104",
 ]
 
 [[package]]

@@ -22,7 +22,6 @@ use kata_types::{
 };
 use persist::sandbox_persist::Persist;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::path::Path;
 use std::process::Stdio;
@@ -288,13 +287,14 @@ impl QemuInner {
         todo!()
     }
 
-    pub(crate) async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
+    pub(crate) async fn get_thread_ids(&mut self) -> Result<VcpuThreadIds> {
         info!(sl!(), "QemuInner::get_thread_ids()");
-        //todo!()
-        let vcpu_thread_ids: VcpuThreadIds = VcpuThreadIds {
-            vcpus: HashMap::new(),
-        };
-        Ok(vcpu_thread_ids)
+
+        Ok(self
+            .qmp
+            .as_mut()
+            .and_then(|qmp| qmp.get_vcpu_thread_ids().ok())
+            .unwrap_or_default())
     }
 
     pub(crate) async fn get_vmm_master_tid(&self) -> Result<u32> {
@@ -632,16 +632,24 @@ impl QemuInner {
                 qmp.hotplug_network_device(&netdev, &virtio_net_device)?
             }
             DeviceType::Block(mut block_device) => {
-                block_device.config.pci_path = qmp
+                let (pci_path, scsi_addr) = qmp
                     .hotplug_block_device(
                         &self.config.blockdev_info.block_device_driver,
-                        &block_device.device_id,
+                        block_device.config.index,
                         &block_device.config.path_on_host,
+                        &block_device.config.blkdev_aio.to_string(),
                         block_device.config.is_direct,
                         block_device.config.is_readonly,
                         block_device.config.no_drop,
                     )
                     .context("hotplug block device")?;
+
+                if pci_path.is_some() {
+                    block_device.config.pci_path = pci_path;
+                }
+                if scsi_addr.is_some() {
+                    block_device.config.scsi_addr = scsi_addr;
+                }
 
                 return Ok(DeviceType::Block(block_device));
             }

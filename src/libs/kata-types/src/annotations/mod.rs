@@ -273,8 +273,7 @@ pub const KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_EXTRA_ARGS: &str =
 /// A sandbox annotation to specify as the msize for 9p shares.
 pub const KATA_ANNO_CFG_HYPERVISOR_MSIZE_9P: &str = "io.katacontainers.config.hypervisor.msize_9p";
 /// The initdata annotation passed in when CVM launchs
-pub const KATA_ANNO_CFG_HYPERVISOR_INIT_DATA: &str =
-    "io.katacontainers.config.hypervisor.cc_init_data";
+pub const KATA_ANNO_CFG_RUNTIME_INIT_DATA: &str = "io.katacontainers.config.runtime.cc_init_data";
 
 /// GPU specific annotations for remote hypervisor to help with instance selection
 /// It's for minimum number of GPUs required for the VM.
@@ -635,13 +634,13 @@ impl Annotation {
                     KATA_ANNO_CFG_HYPERVISOR_CPU_FEATURES => {
                         hv.cpu_info.cpu_features = value.to_string();
                     }
-                    KATA_ANNO_CFG_HYPERVISOR_DEFAULT_VCPUS => match self.get_value::<i32>(key) {
+                    KATA_ANNO_CFG_HYPERVISOR_DEFAULT_VCPUS => match self.get_value::<f32>(key) {
                         Ok(num_cpus) => {
                             let num_cpus = num_cpus.unwrap_or_default();
                             if num_cpus
                                 > get_hypervisor_plugin(hypervisor_name)
                                     .unwrap()
-                                    .get_max_cpus() as i32
+                                    .get_max_cpus() as f32
                             {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
@@ -895,7 +894,7 @@ impl Annotation {
                         hv.security_info.validate_path(value)?;
                         hv.security_info.guest_hook_path = value.to_string();
                     }
-                    KATA_ANNO_CFG_HYPERVISOR_INIT_DATA => {
+                    KATA_ANNO_CFG_RUNTIME_INIT_DATA => {
                         hv.security_info.initdata =
                             add_hypervisor_initdata_overrides(value).unwrap();
                     }
@@ -1079,6 +1078,9 @@ impl Annotation {
                 }
             }
         }
+
+        config.adjust_config()?;
+
         Ok(())
     }
 }
