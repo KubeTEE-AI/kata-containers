@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Result};
 use std::result::{self};
-use std::u32;
 
 use serde::Deserialize;
 
@@ -273,7 +272,8 @@ pub const KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_EXTRA_ARGS: &str =
 /// A sandbox annotation to specify as the msize for 9p shares.
 pub const KATA_ANNO_CFG_HYPERVISOR_MSIZE_9P: &str = "io.katacontainers.config.hypervisor.msize_9p";
 /// The initdata annotation passed in when CVM launchs
-pub const KATA_ANNO_CFG_RUNTIME_INIT_DATA: &str = "io.katacontainers.config.runtime.cc_init_data";
+pub const KATA_ANNO_CFG_HYPERVISOR_INIT_DATA: &str =
+    "io.katacontainers.config.hypervisor.cc_init_data";
 
 /// GPU specific annotations for remote hypervisor to help with instance selection
 /// It's for minimum number of GPUs required for the VM.
@@ -462,12 +462,12 @@ impl Annotation {
     /// update config info by annotation
     pub fn update_config_by_annotation(&self, config: &mut TomlConfig) -> Result<()> {
         if let Some(hv) = self.annotations.get(KATA_ANNO_CFG_RUNTIME_HYPERVISOR) {
-            if config.hypervisor.get(hv).is_some() {
+            if config.hypervisor.contains_key(hv) {
                 config.runtime.hypervisor_name = hv.to_string();
             }
         }
         if let Some(ag) = self.annotations.get(KATA_ANNO_CFG_RUNTIME_AGENT) {
-            if config.agent.get(ag).is_some() {
+            if config.agent.contains_key(ag) {
                 config.runtime.agent_name = ag.to_string();
             }
         }
@@ -894,7 +894,7 @@ impl Annotation {
                         hv.security_info.validate_path(value)?;
                         hv.security_info.guest_hook_path = value.to_string();
                     }
-                    KATA_ANNO_CFG_RUNTIME_INIT_DATA => {
+                    KATA_ANNO_CFG_HYPERVISOR_INIT_DATA => {
                         hv.security_info.initdata =
                             add_hypervisor_initdata_overrides(value).unwrap();
                     }
@@ -943,8 +943,7 @@ impl Annotation {
                         }
                     }
                     KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_EXTRA_ARGS => {
-                        let args: Vec<String> =
-                            value.to_string().split(',').map(str::to_string).collect();
+                        let args: Vec<String> = value.split(',').map(str::to_string).collect();
                         for arg in args {
                             hv.shared_fs.virtio_fs_extra_args.push(arg.to_string());
                         }
@@ -970,7 +969,7 @@ impl Annotation {
                     // update agent config
                     KATA_ANNO_CFG_KERNEL_MODULES => {
                         let kernel_mod: Vec<String> =
-                            value.to_string().split(';').map(str::to_string).collect();
+                            value.split(';').map(str::to_string).collect();
                         for modules in kernel_mod {
                             ag.kernel_modules.push(modules.to_string());
                         }
@@ -991,14 +990,16 @@ impl Annotation {
                             return Err(u32_err);
                         }
                     },
-                    KATA_ANNO_CFG_RUNTIME_CREATE_CONTAINTER_TIMEOUT => match self.get_value::<u32>(key) {
-                        Ok(v) => {
-                            ag.request_timeout_ms = v.unwrap_or_default() * 1000;
+                    KATA_ANNO_CFG_RUNTIME_CREATE_CONTAINTER_TIMEOUT => {
+                        match self.get_value::<u32>(key) {
+                            Ok(v) => {
+                                ag.request_timeout_ms = v.unwrap_or_default() * 1000;
+                            }
+                            Err(_e) => {
+                                return Err(u32_err);
+                            }
                         }
-                        Err(_e) => {
-                            return Err(u32_err);
-                        }
-                    },
+                    }
                     // update runtime config
                     KATA_ANNO_CFG_RUNTIME_NAME => {
                         let runtime = vec!["virt-container", "linux-container", "wasm-container"];
@@ -1031,8 +1032,7 @@ impl Annotation {
                         }
                     },
                     KATA_ANNO_CFG_EXPERIMENTAL => {
-                        let args: Vec<String> =
-                            value.to_string().split(',').map(str::to_string).collect();
+                        let args: Vec<String> = value.split(',').map(str::to_string).collect();
                         for arg in args {
                             config.runtime.experimental.push(arg.to_string());
                         }
