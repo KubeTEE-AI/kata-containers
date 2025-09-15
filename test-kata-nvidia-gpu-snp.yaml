@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-kata-nvidia-gpu-snp
+  namespace: nemo
+spec:
+  restartPolicy: Never
+  runtimeClassName: kata-nvidia-gpu-snp
+  nodeSelector:
+    nvidia.com/cc.capable: "true"
+    nvidia.com/gpu.deploy.kata-manager: "true"
+  containers:
+  - name: test-kata-nvidia-gpu-snp
+    image: nvcr.io/nvidia/cuda:11.6.0-base-ubuntu20.04
+    command: ["/bin/bash", "-c", "echo 'Kata NVIDIA GPU SNP test starting' && sleep 10 && echo 'Kata NVIDIA GPU SNP test completed'"]
+    securityContext:
+      privileged: true
+    resources:
+      limits:
+        nvidia.com/GH100_H200_SXM_141GB: 1
+

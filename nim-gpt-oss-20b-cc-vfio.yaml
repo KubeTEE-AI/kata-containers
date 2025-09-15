@@ -1,0 +1,47 @@
+apiVersion: apps.nvidia.com/v1alpha1
+kind: NIMService
+metadata:
+  name: gpt-oss-20b-cc
+  namespace: nemo
+spec:
+  image:
+    repository: nvcr.io/nim/openai/gpt-oss-20b
+    tag: latest
+    pullPolicy: IfNotPresent
+    pullSecrets:
+      - nvcrimagepullsecret
+  authSecret: ngc-api
+  storage:
+    pvc:
+      create: true
+      storageClass: single
+      size: 100Gi
+      volumeAccessMode: ReadWriteOnce
+  replicas: 1
+  runtimeClassName: kata-qemu-nvidia-gpu
+  nodeSelector: {}
+  expose:
+    service:
+      type: ClusterIP
+      port: 8000
+  # Use direct VFIO device access
+  template:
+    spec:
+      containers:
+      - name: gpt-oss-20b-cc
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: vfio-devices
+          mountPath: /dev/vfio
+        - name: pci-devices
+          mountPath: /sys/bus/pci/devices
+      volumes:
+      - name: vfio-devices
+        hostPath:
+          path: /dev/vfio
+          type: Directory
+      - name: pci-devices
+        hostPath:
+          path: /sys/bus/pci/devices
+          type: Directory

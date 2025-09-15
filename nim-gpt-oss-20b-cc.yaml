@@ -1,0 +1,30 @@
+apiVersion: apps.nvidia.com/v1alpha1
+kind: NIMService
+metadata:
+  name: gpt-oss-20b-cc
+  namespace: nemo
+spec:
+  image:
+    repository: nvcr.io/nim/openai/gpt-oss-20b
+    tag: latest
+    pullPolicy: IfNotPresent
+    pullSecrets:
+      - nvcrimagepullsecret
+    # Note: This image may need NVIDIA drivers for TDX VM compatibility
+  authSecret: ngc-api
+  storage:
+    pvc:
+      create: true
+      storageClass: single
+      size: 100Gi
+      volumeAccessMode: ReadWriteOnce
+  replicas: 1
+  resources:
+    limits:
+      nvidia.com/GH100_H200_SXM_141GB: 1
+  runtimeClassName: kata-qemu-nvidia-gpu-tdx
+  nodeSelector: {}
+  expose:
+    service:
+      type: ClusterIP
+      port: 8000
