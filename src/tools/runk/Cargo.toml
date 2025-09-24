@@ -15,7 +15,7 @@ runtime-spec = { path = "../../libs/runtime-spec" }
 oci-spec = { version = "0.8.1", features = ["runtime"] }
 logging = { path = "../../libs/logging" }
 liboci-cli = "0.5.3"
-clap = { version = "4.5.40", features = ["derive", "cargo"] }
+clap = { version = "4.5.48", features = ["derive", "cargo"] }
 libc = "0.2.108"
 nix = "0.23.0"
 anyhow = "1.0.52"
