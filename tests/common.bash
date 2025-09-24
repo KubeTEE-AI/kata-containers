@@ -430,13 +430,13 @@ EOF
 function install_kata_core() {
 	declare -r katadir="$1"
 	declare -r destdir="/"
-	declare -r kata_tarball="kata-static.tar.xz"
+	declare -r kata_tarball="kata-static.tar.zst"
 
 	# Removing previous kata installation
 	sudo rm -rf "${katadir}"
 
 	pushd "${kata_tarball_dir}"
-	sudo tar -xvf "${kata_tarball}" -C "${destdir}"
+	sudo tar --zstd -xvf "${kata_tarball}" -C "${destdir}"
 	popd
 }
 
@@ -567,7 +567,14 @@ function get_latest_patch_release_from_a_github_project() {
         project="${1}"
         base_version="${2}"
 
-        curl --header \"Authorization: Bearer "${GH_TOKEN:-}"\" --silent https://api.github.com/repos/${project}/releases | jq -r .[].tag_name | grep "^${base_version}.[0-9]*$" -m1
+        curl \
+          --header "Authorization: Bearer "${GH_TOKEN:-}"" \
+          --fail-with-body \
+          --show-error \
+          --silent \
+          "https://api.github.com/repos/${project}/releases" \
+          | jq -r .[].tag_name \
+          | grep "^${base_version}.[0-9]*$" -m1
 }
 
 # base_version: The version to be intalled in the ${major}.${minor} format
@@ -818,7 +825,7 @@ function arch_to_golang() {
 	local arch="$(uname -m)"
 
 	case "${arch}" in
-		aarch64) echo "arm64";;
+		aarch64|arm64) echo "arm64";;
 		ppc64le) echo "${arch}";;
 		riscv64) echo "${arch}";;
 		x86_64) echo "amd64";;

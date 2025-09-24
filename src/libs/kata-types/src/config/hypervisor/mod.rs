@@ -48,6 +48,9 @@ pub use self::ch::{CloudHypervisorConfig, HYPERVISOR_NAME_CH};
 mod remote;
 pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
 
+mod rate_limiter;
+pub use self::rate_limiter::RateLimiterConfig;
+
 /// Virtual PCI block device driver.
 pub const VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
 
@@ -173,6 +176,19 @@ pub struct BlockDeviceInfo {
     /// The default if not set is empty (all annotations rejected.)
     #[serde(default)]
     pub valid_vhost_user_store_paths: Vec<String>,
+
+    /// controls disk I/O bandwidth (size in bits/sec)
+    #[serde(default)]
+    pub disk_rate_limiter_bw_max_rate: u64,
+    /// increases the initial max rate
+    #[serde(default)]
+    pub disk_rate_limiter_bw_one_time_burst: Option<u64>,
+    /// controls disk I/O bandwidth (size in ops/sec)
+    #[serde(default)]
+    pub disk_rate_limiter_ops_max_rate: u64,
+    /// increases the initial max rate
+    #[serde(default)]
+    pub disk_rate_limiter_ops_one_time_burst: Option<u64>,
 }
 
 impl BlockDeviceInfo {
@@ -942,6 +958,10 @@ pub struct SecurityInfo {
     /// Another note: enabling this feature may reduce performance, you may enable
     /// /proc/sys/net/core/bpf_jit_enable to reduce the impact. see https://man7.org/linux/man-pages/man8/bpfc.8.html
     pub seccomp_sandbox: Option<String>,
+
+    /// selinux_label defines SELinux label for the guest
+    #[serde(default)]
+    pub selinux_label: Option<String>,
 }
 
 fn default_qgs_port() -> u32 {
@@ -1281,6 +1301,10 @@ pub struct Hypervisor {
     /// Disables applying SELinux on the container process within the guest.
     #[serde(default = "yes")]
     pub disable_guest_selinux: bool,
+
+    /// Disable applying SELinux on the VMM process.
+    #[serde(default)]
+    pub disable_selinux: bool,
 }
 
 fn yes() -> bool {

@@ -7,8 +7,8 @@ use super::cmdline_generator::{get_network_device, QemuCmdLine, QMP_SOCKET_FILE}
 use super::qmp::Qmp;
 use crate::device::topology::PCIePort;
 use crate::{
-    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, HypervisorConfig,
-    MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
+    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, selinux,
+    HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
 };
 
 use crate::utils::{bytes_to_megs, enter_netns, megs_to_bytes};
@@ -25,10 +25,13 @@ use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::path::Path;
 use std::process::Stdio;
-use tokio::sync::{mpsc, Mutex};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, ChildStderr, Command},
+};
+use tokio::{
+    net::UnixStream,
+    sync::{mpsc, Mutex},
 };
 
 const VSOCK_SCHEME: &str = "vsock";
@@ -62,10 +65,22 @@ impl QemuInner {
         }
     }
 
-    pub(crate) async fn prepare_vm(&mut self, id: &str, netns: Option<String>) -> Result<()> {
+    pub(crate) async fn prepare_vm(
+        &mut self,
+        id: &str,
+        netns: Option<String>,
+        selinux_label: Option<String>,
+    ) -> Result<()> {
         info!(sl!(), "Preparing QEMU VM");
         self.id = id.to_string();
         self.netns = netns;
+
+        if !self.hypervisor_config().disable_selinux {
+            if let Some(label) = selinux_label.as_ref() {
+                self.config.security_info.selinux_label = Some(label.to_string());
+                selinux::set_exec_label(label).context("failed to set SELinux process label")?;
+            }
+        }
 
         let vm_path = [KATA_PATH, self.id.as_str()].join("/");
         std::fs::create_dir_all(vm_path)?;
@@ -193,11 +208,23 @@ impl QemuInner {
 
         info!(sl!(), "qemu cmd: {:?}", command);
 
-        // we need move the qemu process into Network Namespace.
+        // we need move the qemu process into Network Namespace and set SELinux label.
         unsafe {
+            let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre_exec = command.pre_exec(move || {
                 let _ = enter_netns(&netns);
-
+                if let Some(label) = selinux_label.as_ref() {
+                    if let Err(e) = selinux::set_exec_label(label) {
+                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
+                        // Don't return error here to avoid breaking the process startup
+                        // Log the error and continue
+                    } else {
+                        info!(
+                            sl!(),
+                            "Successfully set SELinux label in child process: {}", &label
+                        );
+                    }
+                }
                 Ok(())
             });
         }
@@ -221,6 +248,12 @@ impl QemuInner {
                 error!(sl!(), "couldn't initialise QMP: {:?}", e);
                 return Err(e);
             }
+        }
+
+        //When hypervisor debug is enabled, output the kernel boot messages for debugging.
+        if self.config.debug_info.enable_debug {
+            let stream = UnixStream::connect(console_socket_path.as_os_str()).await?;
+            tokio::spawn(log_qemu_console(stream));
         }
 
         Ok(())
@@ -567,6 +600,24 @@ impl QemuInner {
 
         Ok((new_total_mem_mb, MemoryConfig::default()))
     }
+}
+
+async fn log_qemu_console(console: UnixStream) -> Result<()> {
+    info!(sl!(), "starting reading qemu console");
+
+    let stderr_reader = BufReader::new(console);
+    let mut stderr_lines = stderr_reader.lines();
+
+    while let Some(buffer) = stderr_lines
+        .next_line()
+        .await
+        .context("next_line() failed on qemu console")?
+    {
+        info!(sl!(), "vm console: {:?}", buffer);
+    }
+
+    info!(sl!(), "finished reading qemu console");
+    Ok(())
 }
 
 async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Result<()> {

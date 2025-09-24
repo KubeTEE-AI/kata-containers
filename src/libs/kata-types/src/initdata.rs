@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::sl;
 use anyhow::{anyhow, Context, Result};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::{collections::HashMap, io::Read};
-use crate::sl;
 
 /// Currently, initdata only supports version 0.1.0.
 const INITDATA_VERSION: &str = "0.1.0";
@@ -24,6 +24,8 @@ pub enum ProtectedPlatform {
     Snp,
     /// Cca platform for ARM CCA
     Cca,
+    /// Se platform for IBM SEL
+    Se,
     /// Default with no protection
     #[default]
     NoProtection,
@@ -155,6 +157,7 @@ fn adjust_digest(digest: &[u8], platform: ProtectedPlatform) -> Vec<u8> {
         ProtectedPlatform::Tdx => 48,
         ProtectedPlatform::Snp => 32,
         ProtectedPlatform::Cca => 64,
+        ProtectedPlatform::Se => 256,
         ProtectedPlatform::NoProtection => digest.len(),
     };
 
@@ -204,15 +207,14 @@ pub fn calculate_initdata_digest(
     Ok(b64encoded_digest)
 }
 
-/// The argument `initdata_annotation` is a Standard base64 encoded string containing a TOML formatted content.
-/// This function decodes the base64 string, parses the TOML content into an InitData structure.
-pub fn add_hypervisor_initdata_overrides(initdata_annotation: &str) -> Result<String> {
-    // If the initdata is empty, return an empty string
-    if initdata_annotation.is_empty() {
-        info!(sl!(), "initdata_annotation is empty");
-        return Ok("".to_string());
-    }
+/// Encodes initdata as an annotation
+pub fn encode_initdata(init_data: &InitData) -> String {
+    let toml_str = toml::to_string(&init_data).unwrap();
+    create_encoded_input(&toml_str)
+}
 
+/// Decodes initdata annotation
+pub fn decode_initdata(initdata_annotation: &str) -> Result<InitData> {
     // Base64 decode the annotation value
     let b64_decoded =
         base64::decode_config(initdata_annotation, base64::STANDARD).context("base64 decode")?;
@@ -224,11 +226,32 @@ pub fn add_hypervisor_initdata_overrides(initdata_annotation: &str) -> Result<St
         .read_to_string(&mut initdata_str)
         .context("gz decoder failed")?;
 
-    // Parse the initdata
-    let initdata: InitData = parse_initdata(&initdata_str).context("parse initdata overrides")?;
+    // Return parsed initdata
+    let initdata = parse_initdata(&initdata_str).context("parse initdata overrides")?;
 
-    // initdata within a TOML string
-    initdata.to_string()
+    Ok(initdata)
+}
+
+/// The argument `initdata_annotation` is a Standard base64 encoded string containing a TOML formatted content.
+/// This function decodes the base64 string, parses the TOML content into an InitData structure.
+pub fn add_hypervisor_initdata_overrides(initdata_annotation: &str) -> Result<String> {
+    // If the initdata is empty, return an empty string
+    if initdata_annotation.is_empty() {
+        info!(sl!(), "initdata_annotation is empty");
+        return Ok("".to_string());
+    }
+
+    decode_initdata(initdata_annotation)?.to_string()
+}
+
+use std::io::Write;
+
+/// create gzipped and base64 encoded string
+fn create_encoded_input(content: &str) -> String {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(content.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    base64::encode_config(&compressed, base64::STANDARD)
 }
 
 #[cfg(test)]
@@ -237,14 +260,6 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
-
-    // create gzipped and base64 encoded string
-    fn create_encoded_input(content: &str) -> String {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(content.as_bytes()).unwrap();
-        let compressed = encoder.finish().unwrap();
-        base64::encode_config(&compressed, base64::STANDARD)
-    }
 
     #[test]
     fn test_empty_annotation() {
@@ -432,6 +447,12 @@ key = "value"
         assert_eq!(cca_result.len(), 64);
         assert_eq!(&cca_result[..32], &short_digest[..]);
         assert_eq!(&cca_result[32..], vec![0u8; 32]);
+
+        // Test SE platform (requires 256 bytes)
+        let long_digest = vec![0xAA; 256];
+        let se_result = adjust_digest(&long_digest, ProtectedPlatform::Se);
+        assert_eq!(se_result.len(), 256);
+        assert_eq!(&se_result[..256], &long_digest[..256]);
     }
 
     /// Test hypervisor initdata processing with compression
