@@ -49,7 +49,7 @@ dependencies = [
  "log",
  "logging",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "protobuf",
  "protocols",
  "serde",
@@ -584,7 +584,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.25.1",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "thiserror 1.0.69",
  "zbus",
 ]
@@ -639,7 +639,7 @@ dependencies = [
  "kata-types",
  "lazy_static",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "persist",
  "protobuf",
  "protocols",
@@ -1937,7 +1937,7 @@ dependencies = [
  "libc",
  "logging",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "path-clean",
  "persist",
  "protobuf",
@@ -2248,7 +2248,7 @@ dependencies = [
  "libc",
  "mockall",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "once_cell",
  "pci-ids",
  "rand 0.8.5",
@@ -2275,7 +2275,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "num_cpus",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "regex",
  "safe-path 0.1.0",
  "serde",
@@ -2919,9 +2919,9 @@ dependencies = [
 
 [[package]]
 name = "oci-spec"
-version = "0.8.1"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57e9beda9d92fac7bf4904c34c83340ef1024159faee67179a04e0277523da33"
+checksum = "2eb4684653aeaba48dea019caa17b2773e1212e281d50b6fa759f36fe032239d"
 dependencies = [
  "const_format",
  "derive_builder",
@@ -3575,7 +3575,7 @@ name = "protocols"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "protobuf",
  "serde",
  "serde_json",
@@ -3889,7 +3889,7 @@ dependencies = [
  "netlink-sys",
  "netns-rs",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "persist",
  "rand 0.8.5",
  "rtnetlink",
@@ -3990,7 +3990,7 @@ dependencies = [
  "logging",
  "netns-rs",
  "nix 0.25.1",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "opentelemetry",
  "opentelemetry-jaeger",
  "persist",
@@ -4396,7 +4396,7 @@ dependencies = [
  "log",
  "logging",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "protobuf",
  "rand 0.8.5",
  "runtime-spec",
@@ -5347,7 +5347,7 @@ dependencies = [
  "libc",
  "logging",
  "nix 0.26.4",
- "oci-spec 0.8.1",
+ "oci-spec 0.8.3",
  "persist",
  "protobuf",
  "resource",
