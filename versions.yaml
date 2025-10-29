@@ -88,8 +88,8 @@ assets:
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "v10.1.0"
-      tag: "v10.1.0"
+      version: "v10.1.1"
+      tag: "v10.1.1"
       # Do not include any non-full release versions
       # Break the line *without CR or space being appended*, to appease
       # yamllint, and note the deliberate ' ' at the end of the expression.
@@ -98,6 +98,11 @@ assets:
       uscan-url: >-
         https://github.com/qemu/qemu/tags
         .*/v?(\d\S+)\.tar\.gz
+
+    qemu-cca-experimental:
+      description: "QEMU with experimental CCA support"
+      url: "https://git.codelinaro.org/linaro/dcap/qemu.git"
+      tag: "97345ddc501d3eb45bbbf15d97608fba0c2c0c7b"
 
     qemu-snp-experimental:
       description: "QEMU with GPU+SNP support"
@@ -123,6 +128,9 @@ assets:
       aarch64:
         name: "ubuntu"
         version: "noble"  # 24.04 LTS
+        confidential:
+          name: "ubuntu"
+          version: "noble" # 24.04 LTS
         nvidia-gpu:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
@@ -163,6 +171,9 @@ assets:
       aarch64:
         name: "alpine"
         version: "3.22"
+        confidential:
+          name: "ubuntu"
+          version: "noble"  # 24.04 LTS
         nvidia-gpu:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
@@ -206,6 +217,11 @@ assets:
     description: "Linux kernel with cpu/mem hotplug support on arm64"
     url: "https://cdn.kernel.org/pub/linux/kernel/v5.x/"
     version: "v5.15.138"
+    confidential:
+      description: "Linux kernel with RME support on arm64"
+      url: "https://gitlab.arm.com/linux-arm/linux-cca"
+      version: "v6.15.0-rc1-916aeec68dd4500a1cdf4ebf214c5620955daf3f"
+      ref: "916aeec68dd4500a1cdf4ebf214c5620955daf3f"
 
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
@@ -263,10 +279,10 @@ externals:
     # version older than them.
     version: "v1.7.25"
     lts: "v1.7"
-    active: "v2.0"
+    active: "v2.1"
     # keep the latest version to make the current PR ci work, once it was
     # merged,we can remove the latest version.
-    latest: "v2.0"
+    latest: "v2.2"
 
   critools:
     description: "CLI tool for Container Runtime Interface (CRI)"
@@ -344,6 +360,8 @@ externals:
     url: "https://github.com/dragonflyoss/image-service"
     version: "v2.2.3"
 
+  # Keep the version here aligned with the NYDUS_SNAPSHOTTER_VERSION
+  # on tools/packaging/kata-deploy/Dockerfile
   nydus-snapshotter:
     description: "Snapshotter for Nydus image acceleration service"
     url: "https://github.com/containerd/nydus-snapshotter"
@@ -352,7 +370,7 @@ externals:
   opa:
     description: "Open Policy Agent"
     url: "https://github.com/open-policy-agent/opa"
-    version: "v1.6.0"
+    version: "v1.9.0"
 
   ovmf:
     description: "Firmware, implementation of UEFI for virtual machines."
@@ -371,6 +389,12 @@ externals:
     arm64:
       description: "UEFI for arm64 virtual machines."
       version: "edk2-stable202508"
+      package: "ArmVirtPkg/ArmVirtQemu.dsc"
+      package_output_dir: "ArmVirtQemu-AARCH64"
+    cca:
+      description: "UEFI for arm64 CCA virtual machines."
+      version: "cca/2025-02-06"
+      url: "https://git.codelinaro.org/linaro/dcap/edk2"
       package: "ArmVirtPkg/ArmVirtQemu.dsc"
       package_output_dir: "ArmVirtQemu-AARCH64"
 

@@ -35,10 +35,47 @@ info() {
 
 DEBUG="${DEBUG:-"false"}"
 
-SHIMS="${SHIMS:-"clh cloud-hypervisor dragonball fc qemu qemu-coco-dev qemu-runtime-rs qemu-se-runtime-rs qemu-snp qemu-tdx stratovirt qemu-nvidia-gpu qemu-nvidia-gpu-snp qemu-nvidia-gpu-tdx"}"
-IFS=' ' read -a shims <<< "$SHIMS"
+ARCH=$(uname -m)
+
+SHIMS="${SHIMS:-"clh cloud-hypervisor dragonball fc qemu qemu-coco-dev qemu-runtime-rs qemu-se-runtime-rs qemu-snp qemu-tdx stratovirt qemu-nvidia-gpu qemu-nvidia-gpu-snp qemu-nvidia-gpu-tdx qemu-cca"}"
+SHIMS_X86_64="${SHIMS_X86_64:-${SHIMS}}"
+SHIMS_AARCH64="${SHIMS_AARCH64:-${SHIMS}}"
+SHIMS_S390X="${SHIMS_S390X:-${SHIMS}}"
+SHIMS_PPC64LE="${SHIMS_PPC64LE:-${SHIMS}}"
+
 DEFAULT_SHIM="${DEFAULT_SHIM:-"qemu"}"
-default_shim="$DEFAULT_SHIM"
+DEFAULT_SHIM_X86_64="${DEFAULT_SHIM_X86_64:-${DEFAULT_SHIM}}"
+DEFAULT_SHIM_AARCH64="${DEFAULT_SHIM_AARCH64:-${DEFAULT_SHIM}}"
+DEFAULT_SHIM_S390X="${DEFAULT_SHIM_S390X:-${DEFAULT_SHIM}}"
+DEFAULT_SHIM_PPC64LE="${DEFAULT_SHIM_PPC64LE:-${DEFAULT_SHIM}}"
+
+SHIMS_FOR_ARCH=""
+DEFAULT_SHIM_FOR_ARCH=""
+case ${ARCH} in
+	x86_64)
+		SHIMS_FOR_ARCH="${SHIMS_X86_64}"
+		DEFAULT_SHIM_FOR_ARCH="${DEFAULT_SHIM_X86_64}"
+		;;
+	aarch64)
+		SHIMS_FOR_ARCH="${SHIMS_AARCH64}"
+		DEFAULT_SHIM_FOR_ARCH="${DEFAULT_SHIM_AARCH64}"
+		;;
+	s390x)
+		SHIMS_FOR_ARCH="${SHIMS_S390X}"
+		DEFAULT_SHIM_FOR_ARCH="${DEFAULT_SHIM_S390X}"
+		;;
+	ppc64le)
+		SHIMS_FOR_ARCH="${SHIMS_PPC64LE}"
+		DEFAULT_SHIM_FOR_ARCH="${DEFAULT_SHIM_PPC64LE}"
+		;;
+	*)
+		SHIMS_FOR_ARCH="${SHIMS}"
+		DEFAULT_SHIM_FOR_ARCH="${DEFAULT_SHIM}"
+		;;
+esac
+
+IFS=' ' read -a shims <<< "${SHIMS_FOR_ARCH}"
+default_shim="${DEFAULT_SHIM_FOR_ARCH}"
 
 CREATE_RUNTIMECLASSES="${CREATE_RUNTIMECLASSES:-"false"}"
 CREATE_DEFAULT_RUNTIMECLASS="${CREATE_DEFAULT_RUNTIMECLASS:-"false"}"
@@ -61,6 +98,12 @@ AGENT_NO_PROXY="${AGENT_NO_PROXY:-}"
 
 PULL_TYPE_MAPPING="${PULL_TYPE_MAPPING:-}"
 IFS=',' read -a pull_types <<< "$PULL_TYPE_MAPPING"
+
+EXPERIMENTAL_SETUP_SNAPSHOTTER="${EXPERIMENTAL_SETUP_SNAPSHOTTER:-}"
+IFS=',' read -a experimental_setup_snapshotter <<< "${EXPERIMENTAL_SETUP_SNAPSHOTTER}"
+
+EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL:-}"
+IFS="," read -a experimental_force_guest_pull <<< "${EXPERIMENTAL_FORCE_GUEST_PULL}"
 
 INSTALLATION_PREFIX="${INSTALLATION_PREFIX:-}"
 default_dest_dir="/opt/kata"
@@ -352,7 +395,8 @@ function adjust_qemu_cmdline() {
 	# The paths on the kata-containers tarball side look like:
 	# ${dest_dir}/opt/kata/share/kata-qemu/qemu
 	# ${dest_dir}/opt/kata/share/kata-qemu-snp-experimnental/qemu
-	[[ "${shim}" =~ ^(qemu-nvidia-gpu-snp|qemu-nvidia-gpu-tdx)$ ]] && qemu_share=${shim}-experimental
+	# ${dest_dir}/opt/kata/share/kata-qemu-cca-experimental/qemu
+	[[ "${shim}" =~ ^(qemu-nvidia-gpu-snp|qemu-nvidia-gpu-tdx|qemu-cca)$ ]] && qemu_share=${shim}-experimental
 
 	# Both qemu and qemu-coco-dev use exactly the same QEMU, so we can adjust
 	# the shim on the qemu-coco-dev case to qemu
@@ -421,13 +465,17 @@ function install_artifacts() {
 			sed -i -e "s/^enable_annotations = \[\(.*\)\]/enable_annotations = [\1, $allowed_hypervisor_annotations]/" "${kata_config_file}"
 		fi
 
+		if printf '%s\n' "${experimental_force_guest_pull[@]}" | grep -Fxq "${shim}"; then
+			sed -i -e 's/^\(experimental_force_guest_pull\).*=.*$/\1 = true/g' "${kata_config_file}"
+		fi
+
 		if grep -q "tdx" <<< "$shim"; then
   			VERSION_ID=version_unset # VERSION_ID may be unset, see https://www.freedesktop.org/software/systemd/man/latest/os-release.html#Notes
 			source /host/etc/os-release || source /host/usr/lib/os-release
 			case ${ID} in
 				ubuntu)
 					case ${VERSION_ID} in
-						24.04|25.04)
+						24.04|25.04|25.10)
 							tdx_supported ${ID} ${VERSION_ID} ${kata_config_file}
 							;;
 						*)
@@ -452,7 +500,10 @@ function install_artifacts() {
 		fi
 
 		if [ "${dest_dir}" != "${default_dest_dir}" ]; then
-			kernel_path=$(tomlq ".hypervisor.${shim}.path" ${kata_config_file} | tr -d \")
+			hypervisor="${shim}"
+			[[ "${shim}" == "qemu"* ]] && hypervisor="qemu"
+
+			kernel_path=$(tomlq ".hypervisor.${hypervisor}.path" ${kata_config_file} | tr -d \")
 			if echo $kernel_path | grep -q "${dest_dir}"; then
 				# If we got to this point here, it means that we're dealing with
 				# a kata containers configuration file that has already been changed
@@ -466,7 +517,7 @@ function install_artifacts() {
 				sed -i -e "s|${default_dest_dir}|${dest_dir}|g" "${kata_config_file}"
 
 				# Let's only adjust qemu_cmdline for the QEMUs that we build and ship ourselves
-				[[ "${shim}" =~ ^(qemu|qemu-snp|qemu-nvidia-gpu|qemu-nvidia-gpu-snp|qemu-nvidia-gpu-tdx|qemu-se|qemu-coco-dev)$ ]] && \
+				[[ "${shim}" =~ ^(qemu|qemu-snp|qemu-nvidia-gpu|qemu-nvidia-gpu-snp|qemu-nvidia-gpu-tdx|qemu-se|qemu-coco-dev|qemu-cca)$ ]] && \
 					adjust_qemu_cmdline "${shim}" "${kata_config_file}"
 			fi
 		fi
@@ -497,26 +548,33 @@ function wait_till_node_is_ready() {
 	done
 }
 
+function restart_runtime() {
+	local runtime="${1}"
+
+	if [ "${runtime}" == "k0s-worker" ] || [ "${runtime}" == "k0s-controller" ]; then
+		# do nothing, k0s will automatically load the config on the fly
+		:
+	elif [ "${runtime}" == "microk8s" ]; then
+		host_systemctl restart snap.microk8s.daemon-containerd.service
+	else
+		host_systemctl daemon-reload
+		host_systemctl restart "${runtime}"
+	fi
+
+	wait_till_node_is_ready
+}
+
 function configure_cri_runtime() {
-	case $1 in
+	local runtime="${1}"
+
+	case "${runtime}" in
 	crio)
 		configure_crio
 		;;
 	containerd | k3s | k3s-agent | rke2-agent | rke2-server | k0s-controller | k0s-worker | microk8s)
-		configure_containerd "$1"
+		configure_containerd "${runtime}"
 		;;
 	esac
-	if [ "$1" == "k0s-worker" ] || [ "$1" == "k0s-controller" ]; then
-		# do nothing, k0s will automatically load the config on the fly
-		:
-	elif [ "$1" == "microk8s" ]; then
-		host_systemctl restart snap.microk8s.daemon-containerd.service
-	else
-		host_systemctl daemon-reload
-		host_systemctl restart "$1"
-	fi
-
-	wait_till_node_is_ready
 }
 
 function configure_crio_runtime() {
@@ -654,6 +712,10 @@ function configure_containerd_runtime() {
 			fi
 
 			value="${m#*$snapshotters_delimiter}"
+			if [[ "${value}" == "nydus" ]] && [[ -n "${MULTI_INSTALL_SUFFIX}" ]]; then
+				value="${value}-${MULTI_INSTALL_SUFFIX}"
+			fi
+
 			tomlq -i -t $(printf '%s.snapshotter="%s"' ${runtime_table} ${value}) ${configuration_file}
 			break
 		done
@@ -673,7 +735,9 @@ function configure_containerd() {
 	fi
 
 	if [ $use_containerd_drop_in_conf_file = "true" ]; then
-		tomlq -i -t $(printf '.imports|=.+["%s"]' ${containerd_drop_in_conf_file}) ${containerd_conf_file}
+		if ! grep -q "${containerd_drop_in_conf_file}" ${containerd_conf_file}; then
+			tomlq -i -t $(printf '.imports|=.+["%s"]' ${containerd_drop_in_conf_file}) ${containerd_conf_file}
+		fi
 	fi
 
 	for shim in "${shims[@]}"; do
@@ -767,6 +831,23 @@ function containerd_snapshotter_version_check() {
 	fi
 }
 
+function containerd_erofs_snapshotter_version_check() {
+	local container_runtime_version=$(kubectl get node $NODE_NAME -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')
+	local containerd_prefix="containerd://"
+	local containerd_version=${container_runtime_version#$containerd_prefix}
+	local min_version_major="2"
+	local min_version_minor="2"
+
+	# Extract major.minor (strip patch and prerelease stuff)
+	local major=${containerd_version%%.*}
+	local rest=${containerd_version#*.}
+	local minor=${rest%%[^0-9]*}
+
+	if [ "${min_version_major}" -gt "${major}" ] || { [ "${min_version_major}" -eq "${major}" ] && [ "${min_version_minor}" -gt "${minor}" ]; }; then
+		die "In order to use erofs-snapshotter containerd must be 2.2.0 or newer"
+	fi
+}
+
 function snapshotter_handler_mapping_validation_check() {
 	echo "Validating the snapshotter-handler mapping: \"${SNAPSHOTTER_HANDLER_MAPPING}\""
 	if [ -z "${SNAPSHOTTER_HANDLER_MAPPING}" ]; then
@@ -797,6 +878,143 @@ function snapshotter_handler_mapping_validation_check() {
 	done
 }
 
+function configure_erofs_snapshotter() {
+	info "Configuring erofs-snapshotter"
+
+	# As it's only supported with containerd 2.2.0 or newer
+	# we don't even care about the config file format, as
+	# it'll always be 3 (at least till version 4 is out).
+	#
+	# Also, drop-in is always supported on containerd 2.x
+	configuration_file="${1}"
+
+	tomlq -i -t $(printf '.plugins."io.containerd.cri.v1.images".discard_unpacked_layers=false') ${configuration_file}
+
+	tomlq -i -t $(printf '.plugins."io.containerd.service.v1.diff-service".default=["erofs","walking"]') ${configuration_file}
+
+	tomlq -i -t $(printf '.plugins."io.containerd.snapshotter.v1.erofs".enable_fsverity=true') ${configuration_file}
+	tomlq -i -t $(printf '.plugins."io.containerd.snapshotter.v1.erofs".set_immutable=true') ${configuration_file}
+}
+
+function configure_nydus_snapshotter() {
+	info "Configuring nydus-snapshotter"
+
+	local nydus="nydus"
+	local containerd_nydus="nydus-snapshotter"
+	if [[ -n "${MULTI_INSTALL_SUFFIX}" ]]; then
+		nydus="${nydus}-${MULTI_INSTALL_SUFFIX}"
+		containerd_nydus="${containerd_nydus}-${MULTI_INSTALL_SUFFIX}"
+	fi
+
+	configuration_file="${1}"
+	pluginid="${2}"
+
+	tomlq -i -t $(printf '.plugins.%s.disable_snapshot_annotations=false' ${pluginid}) ${configuration_file}
+
+	tomlq -i -t $(printf '.proxy_plugins."%s".type="snapshot"' ${nydus} ) ${configuration_file}
+	tomlq -i -t $(printf '.proxy_plugins."%s".address="/run/%s/containerd-nydus-grpc.sock"' ${nydus} ${containerd_nydus}) ${configuration_file}
+}
+
+function configure_snapshotter() {
+	snapshotter="${1}"
+
+	local runtime="$(get_container_runtime)"
+	local pluginid="\"io.containerd.grpc.v1.cri\".containerd" # version = 2
+	local configuration_file="${containerd_conf_file}"
+
+	# Properly set the configuration file in case drop-in files are supported
+	if [[ ${use_containerd_drop_in_conf_file} == "true" ]]; then
+		configuration_file="/host${containerd_drop_in_conf_file}"
+	fi
+
+	local containerd_root_conf_file="${containerd_conf_file}"
+	if [[ "${runtime}" =~ ^(k0s-worker|k0s-controller)$ ]]; then
+		containerd_root_conf_file="/etc/containerd/containerd.toml"
+	fi
+
+	if grep -q "version = 3\>" ${containerd_root_conf_file}; then
+		pluginid=\"io.containerd.cri.v1.images\"
+	fi
+
+	case "${snapshotter}" in
+		nydus)
+			configure_nydus_snapshotter "${configuration_file}" "${pluginid}"
+
+			nydus_snapshotter="nydus-snapshotter"
+			if [[ -n "${MULTI_INSTALL_SUFFIX}" ]]; then
+				nydus_snapshotter="${nydus_snapshotter}-${MULTI_INSTALL_SUFFIX}"
+			fi
+			host_systemctl restart "${nydus_snapshotter}"
+			;;
+		erofs)
+			configure_erofs_snapshotter "${configuration_file}"
+			;;
+	esac
+}
+
+function install_nydus_snapshotter() {
+	info "Deploying nydus-snapshotter"
+
+	local nydus_snapshotter="nydus-snapshotter"
+	if [[ -n "${MULTI_INSTALL_SUFFIX}" ]]; then
+		nydus_snapshotter="${nydus_snapshotter}-${MULTI_INSTALL_SUFFIX}"
+	fi
+
+	local config_guest_pulling="/opt/kata-artifacts/nydus-snapshotter/config-guest-pulling.toml"
+	local nydus_snapshotter_service="/opt/kata-artifacts/nydus-snapshotter/nydus-snapshotter.service"
+	
+	# Adjust the paths for the config-guest-pulling.toml and nydus-snapshotter.service
+	sed -i -e "s|@SNAPSHOTTER_ROOT_DIR@|/var/lib/${nydus_snapshotter}|g" "${config_guest_pulling}"
+	sed -i -e "s|@SNAPSHOTTER_GRPC_SOCKET_ADDRESS@|/run/${nydus_snapshotter}/containerd-nydus-grpc.sock|g" "${config_guest_pulling}"
+	sed -i -e "s|@NYDUS_OVERLAYFS_PATH@|${host_install_dir#/host}/nydus-snapshotter/nydus-overlayfs|g" "${config_guest_pulling}"
+
+	sed -i -e "s|@CONTAINERD_NYDUS_GRPC_BINARY@|${host_install_dir#/host}/nydus-snapshotter/containerd-nydus-grpc|g" "${nydus_snapshotter_service}"
+	sed -i -e "s|@CONFIG_GUEST_PULLING@|${host_install_dir#/host}/nydus-snapshotter/config-guest-pulling.toml|g" "${nydus_snapshotter_service}"
+
+	mkdir -p "${host_install_dir}/nydus-snapshotter"
+	install -D -m 775 /opt/kata-artifacts/nydus-snapshotter/containerd-nydus-grpc "${host_install_dir}/nydus-snapshotter/containerd-nydus-grpc"
+	install -D -m 775 /opt/kata-artifacts/nydus-snapshotter/nydus-overlayfs "${host_install_dir}/nydus-snapshotter/nydus-overlayfs"
+
+	install -D -m 644 "${config_guest_pulling}" "${host_install_dir}/nydus-snapshotter/config-guest-pulling.toml"
+	install -D -m 644 "${nydus_snapshotter_service}" "/host/etc/systemd/system/${nydus_snapshotter}.service"
+
+	host_systemctl daemon-reload
+	host_systemctl enable "${nydus_snapshotter}.service"
+}
+
+function uninstall_nydus_snapshotter() {
+	info "Removing deployed nydus-snapshotter"
+
+	local nydus_snapshotter="nydus-snapshotter"
+	if [[ -n "${MULTI_INSTALL_SUFFIX}" ]]; then
+		nydus_snapshotter="${nydus_snapshotter}-${MULTI_INSTALL_SUFFIX}"
+	fi
+	
+	host_systemctl disable --now "${nydus_snapshotter}.service"
+
+	rm -f "/host/etc/systemd/system/${nydus_snapshotter}.service"
+	rm -rf "${host_install_dir}/nydus-snapshotter"
+
+	host_systemctl daemon-reload
+}
+
+function install_snapshotter() {
+	snapshotter="${1}"
+
+	case "${snapshotter}" in
+		erofs) ;; # it's a containerd's built-in snapshotter
+		nydus) install_nydus_snapshotter ;;
+	esac
+}
+
+function uninstall_snapshotter() {
+	snapshotter="${1}"
+
+	case "${snapshotter}" in
+		nydus) uninstall_nydus_snapshotter ;;
+	esac
+}
+
 function main() {
 	action=${1:-}
 	if [ -z "$action" ]; then
@@ -811,7 +1029,15 @@ function main() {
 	echo "* NODE_NAME: ${NODE_NAME}"
 	echo "* DEBUG: ${DEBUG}"
 	echo "* SHIMS: ${SHIMS}"
+	echo "  * x86_64: ${SHIMS_X86_64}"
+	echo "  * aarch64: ${SHIMS_AARCH64}"
+	echo "  * s390x: ${SHIMS_S390X}"
+	echo "  * ppc64le: ${SHIMS_PPC64LE}"
 	echo "* DEFAULT_SHIM: ${DEFAULT_SHIM}"
+	echo "  * x86_64: ${DEFAULT_SHIM_X86_64}"
+	echo "  * aarch64: ${DEFAULT_SHIM_AARCH64}"
+	echo "  * s390x: ${DEFAULT_SHIM_S390X}"
+	echo "  * ppc64le: ${DEFAULT_SHIM_PPC64LE}"
 	echo "* CREATE_RUNTIMECLASSES: ${CREATE_RUNTIMECLASSES}"
 	echo "* CREATE_DEFAULT_RUNTIMECLASS: ${CREATE_DEFAULT_RUNTIMECLASS}"
 	echo "* ALLOWED_HYPERVISOR_ANNOTATIONS: ${ALLOWED_HYPERVISOR_ANNOTATIONS}"
@@ -822,6 +1048,8 @@ function main() {
 	echo "* INSTALLATION_PREFIX: ${INSTALLATION_PREFIX}"
 	echo "* MULTI_INSTALL_SUFFIX: ${MULTI_INSTALL_SUFFIX}"
 	echo "* HELM_POST_DELETE_HOOK: ${HELM_POST_DELETE_HOOK}"
+	echo "* EXPERIMENTAL_SETUP_SNAPSHOTTER: ${EXPERIMENTAL_SETUP_SNAPSHOTTER}"
+	echo "* EXPERIMENTAL_FORCE_GUEST_PULL: ${EXPERIMENTAL_FORCE_GUEST_PULL}"
 
 	# script requires that user is root
 	euid=$(id -u)
@@ -851,7 +1079,6 @@ function main() {
 		containerd_conf_file_backup="${containerd_conf_tmpl_file}.bak"
 	fi
 
-
 	# only install / remove / update if we are dealing with CRIO or containerd
 	if [[ "$runtime" =~ ^(crio|containerd|k3s|k3s-agent|rke2-agent|rke2-server|k0s-worker|k0s-controller|microk8s)$ ]]; then
 		if [ "$runtime" != "crio" ]; then
@@ -871,6 +1098,28 @@ function main() {
 
 		case "$action" in
 		install)
+			# Let's fail early on this, so we don't need to do a rollback
+			# in case we reach this situation.
+			if [[ -n "${EXPERIMENTAL_SETUP_SNAPSHOTTER}" ]]; then
+				if [[ "${runtime}" == "cri-o" ]]; then
+					warn "EXPERIMENTAL_SETUP_SNAPSHOTTER is being ignored!"
+					warn "Snapshotter is a containerd specific option."
+				else
+					for snapshotter in "${experimental_setup_snapshotter[@]}"; do
+						case "${snapshotter}" in
+							erofs)
+								containerd_erofs_snapshotter_version_check
+								;;
+							nydus)
+								;;
+							*)
+								die "${EXPERIMENTAL_SETUP_SNAPSHOTTER} is not a supported snapshotter by kata-deploy"
+								;;
+						esac
+					done
+				fi
+			fi
+
 			if [[ "$runtime" =~ ^(k3s|k3s-agent|rke2-agent|rke2-server)$ ]]; then
 			       if [ ! -f "$containerd_conf_tmpl_file" ] && [ -f "$containerd_conf_file" ]; then
 				       cp "$containerd_conf_file" "$containerd_conf_tmpl_file"
@@ -895,6 +1144,12 @@ function main() {
 
 			install_artifacts
 			configure_cri_runtime "$runtime"
+
+			for snapshotter in "${experimental_setup_snapshotter[@]}"; do
+				install_snapshotter "${snapshotter}"
+				configure_snapshotter "${snapshotter}"
+			done
+			restart_runtime "${runtime}"
 			kubectl label node "$NODE_NAME" --overwrite katacontainers.io/kata-runtime=true
 			;;
 		cleanup)
@@ -915,6 +1170,13 @@ function main() {
 					kubectl label node "$NODE_NAME" katacontainers.io/kata-runtime-
 				fi
 			fi
+
+			for snapshotter in "${experimental_setup_snapshotter[@]}"; do
+				# Here we don't need to do any cleanup on the config, as kata-deploy
+				# will revert the configuration to the state it was before the deployment,
+				# which is also before the snapshotter configuration. :-)
+				uninstall_snapshotter "${EXPERIMENTAL_SETUP_SNAPSHOTTER}"
+			done
 
 			cleanup_cri_runtime "$runtime"
 			if [ "${HELM_POST_DELETE_HOOK}" == "false" ]; then

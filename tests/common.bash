@@ -563,18 +563,25 @@ function get_from_kata_deps() {
 
 # project: org/repo format
 # base_version: ${major}.${minor}
+# allow_unstable: Whether alpha / beta releases should be considered (default: false)
 function get_latest_patch_release_from_a_github_project() {
         project="${1}"
         base_version="${2}"
+        allow_unstable="${3:-false}"
+
+        regex="^${base_version}.[0-9]*$"
+        if [[ "${allow_unstable}" == "true" ]]; then
+                regex="^${base_version}.[0-9]*"
+        fi
 
         curl \
-          --header "Authorization: Bearer "${GH_TOKEN:-}"" \
+          ${GH_TOKEN:+--header "Authorization: Bearer ${GH_TOKEN:-}"} \
           --fail-with-body \
           --show-error \
           --silent \
           "https://api.github.com/repos/${project}/releases" \
           | jq -r .[].tag_name \
-          | grep "^${base_version}.[0-9]*$" -m1
+          | grep "${regex}" -m1
 }
 
 # base_version: The version to be intalled in the ${major}.${minor} format
@@ -674,7 +681,7 @@ function install_cri_containerd() {
 	base_version="${1}"
 
 	project="containerd/containerd"
-	version=$(get_latest_patch_release_from_a_github_project "${project}" "${base_version}")
+	version=$(get_latest_patch_release_from_a_github_project "${project}" "${base_version}" "true")
 
 	tarball_name="containerd-${version//v}-linux-$(${repo_root_dir}/tests/kata-arch.sh -g).tar.gz"
 
@@ -822,7 +829,7 @@ function install_docker() {
 
 # Convert architecture to the name used by golang
 function arch_to_golang() {
-	local arch="$(uname -m)"
+	local -r arch="$(uname -m)"
 
 	case "${arch}" in
 		aarch64|arm64) echo "arm64";;
@@ -839,7 +846,7 @@ function arch_to_rust() {
 	local -r arch="$(uname -m)"
 
 	case "${arch}" in
-		aarch64) echo "${arch}";;
+		aarch64|arm64) echo "aarch64";;
 		ppc64le) echo "powerpc64le";;
 		riscv64) echo "riscv64gc";;
 		x86_64) echo "${arch}";;
@@ -853,7 +860,7 @@ function arch_to_kernel() {
 	local -r arch="$(uname -m)"
 
 	case "${arch}" in
-		aarch64) echo "arm64";;
+		aarch64|arm64) echo "arm64";;
 		ppc64le) echo "powerpc";;
 		x86_64) echo "${arch}";;
 		s390x) echo "s390x";;

@@ -577,7 +577,7 @@ impl AgentPolicy {
         if self.config.raw_out {
             std::io::stdout().write_all(policy.as_bytes()).unwrap();
         }
-        let mut initdata = kata_types::initdata::InitData::new("sha256", "0.1.0");
+        let mut initdata = self.config.initdata.clone();
         initdata.insert_data("policy.rego", policy);
 
         kata_types::initdata::encode_initdata(&initdata)
@@ -960,7 +960,7 @@ fn get_container_annotations(
     if let Some(name) = resource.get_sandbox_name() {
         annotations
             .entry("io.kubernetes.cri.sandbox-name".to_string())
-            .or_insert(name);
+            .or_insert(format!("^{name}$"));
     }
 
     if !is_pause_container {

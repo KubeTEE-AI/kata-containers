@@ -1037,6 +1037,12 @@ impl BaseContainer for LinuxContainer {
         let child_stderr: std::process::Stdio;
 
         if tty {
+            // NOTE(#11842): This code will require changes if we upgrade to nix 0.27+:
+            // - `pseudo` will contain OwnedFds instead of RawFds.
+            // - We'll have to use `OwnedFd::into_raw_fd()` which will
+            //   transfer the ownership to the caller.
+            // - The duplication strategy will not change.
+
             let pseudo = pty::openpty(None, None)?;
             p.term_master = Some(pseudo.master);
             let _ = fcntl::fcntl(pseudo.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
@@ -1045,8 +1051,8 @@ impl BaseContainer for LinuxContainer {
                 .map_err(|e| warn!(logger, "fcntl pseudo.slave {:?}", e));
 
             child_stdin = unsafe { std::process::Stdio::from_raw_fd(pseudo.slave) };
-            child_stdout = unsafe { std::process::Stdio::from_raw_fd(pseudo.slave) };
-            child_stderr = unsafe { std::process::Stdio::from_raw_fd(pseudo.slave) };
+            child_stdout = unsafe { std::process::Stdio::from_raw_fd(unistd::dup(pseudo.slave)?) };
+            child_stderr = unsafe { std::process::Stdio::from_raw_fd(unistd::dup(pseudo.slave)?) };
 
             if let Some(proc_io) = &mut p.proc_io {
                 // A reference count used to clean up the term master fd.
@@ -1914,7 +1920,7 @@ mod tests {
         let cgroups_path = format!(
             "/{}/dummycontainer{}",
             CGROUP_PARENT,
-            since_the_epoch.as_millis()
+            since_the_epoch.as_micros()
         );
 
         let mut spec = SpecBuilder::default()

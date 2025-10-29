@@ -17,9 +17,7 @@ use hypervisor::{
     },
     BlockConfig, BlockDeviceAio, Hypervisor, VfioConfig,
 };
-use kata_types::mount::{
-    Mount, DEFAULT_KATA_GUEST_SANDBOX_DIR, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DIR,
-};
+use kata_types::mount::{kata_guest_sandbox_dir, Mount, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DIR};
 use kata_types::{
     config::{hypervisor::TopologyConfigInfo, TomlConfig},
     mount::{adjust_rootfs_mounts, KATA_IMAGE_FORCE_GUEST_PULL},
@@ -336,7 +334,7 @@ impl ResourceManagerInner {
         }
 
         let shm_size_option = format!("size={}", shm_size);
-        let mount_point = format!("{}/{}", DEFAULT_KATA_GUEST_SANDBOX_DIR, SHM_DIR);
+        let mount_point = format!("{}/{}", kata_guest_sandbox_dir(), SHM_DIR);
 
         let shm_storage = Storage {
             driver: KATA_EPHEMERAL_VOLUME_TYPE.to_string(),
@@ -436,10 +434,11 @@ impl ResourceManagerInner {
                     // create block device for kata agent,
                     // if driver is virtio-blk-pci, the id will be pci address.
                     if let DeviceType::Block(device) = device_info {
-                        // The following would work for drivers virtio-blk-pci and mmio.
-                        // Once scsi support is added, need to handle scsi identifiers.
+                        // The following would work for drivers virtio-blk-pci and virtio-mmio and virtio-scsi.
                         let id = if let Some(pci_path) = device.config.pci_path {
                             pci_path.to_string()
+                        } else if let Some(scsi_address) = device.config.scsi_addr {
+                            scsi_address
                         } else {
                             device.config.virt_path.clone()
                         };

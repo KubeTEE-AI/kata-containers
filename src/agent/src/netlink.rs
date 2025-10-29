@@ -401,7 +401,11 @@ impl Handle {
                 }
 
                 if let RouteAttribute::Oif(index) = attribute {
-                    route.device = self.find_link(LinkFilter::Index(*index)).await?.name();
+                    route.device = self
+                        .find_link(LinkFilter::Index(*index))
+                        .await
+                        .context(format!("error looking up device {index}"))?
+                        .name();
                 }
             }
 
@@ -909,9 +913,14 @@ mod tests {
     use super::*;
     use netlink_packet_route::address::AddressHeader;
     use netlink_packet_route::link::LinkHeader;
+    use serial_test::serial;
     use std::iter;
     use std::process::Command;
     use test_utils::skip_if_not_root;
+
+    // Constants for ARP neighbor tests
+    const TEST_DUMMY_INTERFACE: &str = "dummy_for_arp";
+    const TEST_ARP_IP: &str = "192.0.2.127";
 
     #[tokio::test]
     async fn find_link_by_name() {
@@ -972,11 +981,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(arp_neighbor_tests)]
     async fn list_routes() {
+        clean_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP);
+        let devices: Vec<Interface> = Handle::new().unwrap().list_interfaces().await.unwrap();
         let all = Handle::new()
             .unwrap()
             .list_routes()
             .await
+            .context(format!("available devices: {:?}", devices))
             .expect("Failed to list routes");
 
         assert_ne!(all.len(), 0);
@@ -1088,7 +1101,7 @@ mod tests {
             .expect("prepare: failed to delete neigh");
     }
 
-    fn prepare_env_for_test_add_one_arp_neighbor(dummy_name: &str, ip: &str) {
+    async fn prepare_env_for_test_add_one_arp_neighbor(dummy_name: &str, ip: &str) {
         clean_env_for_test_add_one_arp_neighbor(dummy_name, ip);
         // modprobe dummy
         Command::new("modprobe")
@@ -1102,9 +1115,9 @@ mod tests {
             .output()
             .expect("failed to add dummy interface");
 
-        // ip addr add 192.168.0.2/16 dev dummy
+        // ip addr add 192.0.2.2/24 dev dummy
         Command::new("ip")
-            .args(["addr", "add", "192.168.0.2/16", "dev", dummy_name])
+            .args(["addr", "add", "192.0.2.2/24", "dev", dummy_name])
             .output()
             .expect("failed to add ip for dummy");
 
@@ -1113,24 +1126,26 @@ mod tests {
             .args(["link", "set", dummy_name, "up"])
             .output()
             .expect("failed to up dummy");
+
+        // Wait briefly to ensure the IP address addition is fully complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
+    #[serial(arp_neighbor_tests)]
     async fn test_add_one_arp_neighbor() {
         skip_if_not_root!();
 
         let mac = "6a:92:3a:59:70:aa";
-        let to_ip = "169.254.1.1";
-        let dummy_name = "dummy_for_arp";
 
-        prepare_env_for_test_add_one_arp_neighbor(dummy_name, to_ip);
+        prepare_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP).await;
 
         let mut ip_address = IPAddress::new();
-        ip_address.set_address(to_ip.to_string());
+        ip_address.set_address(TEST_ARP_IP.to_string());
 
         let mut neigh = ARPNeighbor::new();
         neigh.set_toIPAddress(ip_address);
-        neigh.set_device(dummy_name.to_string());
+        neigh.set_device(TEST_DUMMY_INTERFACE.to_string());
         neigh.set_lladdr(mac.to_string());
         neigh.set_state(0x80);
 
@@ -1141,15 +1156,24 @@ mod tests {
             .expect("Failed to add ARP neighbor");
 
         // ip neigh show dev dummy ip
-        let stdout = Command::new("ip")
-            .args(["neigh", "show", "dev", dummy_name, to_ip])
+        let output = Command::new("ip")
+            .args(["neigh", "show", "dev", TEST_DUMMY_INTERFACE, TEST_ARP_IP])
             .output()
-            .expect("failed to show neigh")
-            .stdout;
+            .expect("failed to show neigh");
 
-        let stdout = std::str::from_utf8(&stdout).expect("failed to convert stdout");
-        assert_eq!(stdout.trim(), format!("{} lladdr {} PERMANENT", to_ip, mac));
+        let stdout = std::str::from_utf8(&output.stdout).expect("failed to convert stdout");
+        let stderr = std::str::from_utf8(&output.stderr).expect("failed to convert stderr");
+        assert!(
+            output.status.success(),
+            "`ip neigh show` returned exit code {:?}. stderr: {:?}",
+            output.status.code(),
+            stderr
+        );
+        assert_eq!(
+            stdout.trim(),
+            format!("{} lladdr {} PERMANENT", TEST_ARP_IP, mac)
+        );
 
-        clean_env_for_test_add_one_arp_neighbor(dummy_name, to_ip);
+        clean_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP);
     }
 }

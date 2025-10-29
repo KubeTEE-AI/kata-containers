@@ -49,7 +49,7 @@ mod remote;
 pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
 
 mod rate_limiter;
-pub use self::rate_limiter::RateLimiterConfig;
+pub use self::rate_limiter::{RateLimiterConfig, DEFAULT_RATE_LIMITER_REFILL_TIME};
 
 /// Virtual PCI block device driver.
 pub const VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
@@ -878,6 +878,26 @@ impl NetworkInfo {
     }
 }
 
+/// Configuration information for rootless user.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RootlessUser {
+    /// The UID of the rootless user.
+    #[serde(default)]
+    pub uid: u32,
+
+    /// The GID of the rootless user.
+    #[serde(default)]
+    pub gid: u32,
+
+    /// The supplementary groups of the rootless user.
+    #[serde(default)]
+    pub groups: Vec<u32>,
+
+    /// The username of the rootless user.
+    #[serde(default)]
+    pub user_name: String,
+}
+
 /// Configuration information for security settings.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SecurityInfo {
@@ -888,6 +908,14 @@ pub struct SecurityInfo {
     /// Refer to the documentation for limitations of this mode.
     #[serde(default)]
     pub rootless: bool,
+
+    /// Configuration information for rootless user.
+    ///
+    /// This field must be set if the `rootless` configuration above is enabled.
+    /// It contains the UID, GID, supplementary groups, and the user name of the non-root user
+    /// that will be used to run the VMM process.
+    #[serde(default)]
+    pub rootless_user: Option<RootlessUser>,
 
     /// Disables `seccomp` for the guest VM.
     #[serde(default)]
