@@ -34,11 +34,49 @@ pub struct Job {
 /// See Reference / Kubernetes API / Workload Resources / Job.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSpec {
-    pub template: pod_template::PodTemplateSpec,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activeDeadlineSeconds: Option<i64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     backoffLimit: Option<i32>,
-    // TODO: additional fields.
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backoffLimitPerIndex: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completionMode: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completions: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managedBy: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manualSelector: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maxFailedIndexes: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallelism: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    podFailurePolicy: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    podReplacementPolicy: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successPolicy: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suspend: Option<bool>,
+
+    pub template: pod_template::PodTemplateSpec,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttlSecondsAfterFinished: Option<i32>,
 }
 
 #[async_trait]
@@ -74,7 +112,7 @@ impl yaml::K8sResource for Job {
             storages,
             container,
             settings,
-            &self.spec.template.spec.volumes,
+            &self.spec.template.spec,
         );
     }
 
@@ -112,11 +150,17 @@ impl yaml::K8sResource for Job {
         false
     }
 
-    fn get_process_fields(&self, process: &mut policy::KataProcess, must_check_passwd: &mut bool) {
+    fn get_process_fields(
+        &self,
+        process: &mut policy::KataProcess,
+        must_check_passwd: &mut bool,
+        is_pause_container: bool,
+    ) {
         yaml::get_process_fields(
             process,
-            &self.spec.template.spec.securityContext,
             must_check_passwd,
+            is_pause_container,
+            &self.spec.template.spec.securityContext,
         );
     }
 

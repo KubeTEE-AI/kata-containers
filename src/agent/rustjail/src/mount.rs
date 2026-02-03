@@ -528,7 +528,7 @@ pub fn pivot_rootfs<P: ?Sized + NixPath + std::fmt::Debug>(path: &P) -> Result<(
 
     // Change to the new root so that the pivot_root actually acts on it.
     unistd::fchdir(newroot)?;
-    pivot_root(".", ".").context(format!("failed to pivot_root on {:?}", path))?;
+    pivot_root(".", ".").context(format!("failed to pivot_root on {path:?}"))?;
 
     // Currently our "." is oldroot (according to the current kernel code).
     // However, purely for safety, we will fchdir(oldroot) since there isn't
@@ -752,15 +752,6 @@ fn parse_mount(m: &Mount) -> (MsFlags, MsFlags, String) {
     (flags, pgflags, data.join(","))
 }
 
-// This function constructs a canonicalized path by combining the `rootfs` and `unsafe_path` elements.
-// The resulting path is guaranteed to be ("below" / "in a directory under") the `rootfs` directory.
-//
-// Parameters:
-//
-// - `rootfs` is the absolute path to the root of the containers root filesystem directory.
-// - `unsafe_path` is path inside a container. It is unsafe since it may try to "escape" from the containers
-//    rootfs by using one or more "../" path elements or is its a symlink to path.
-
 fn mount_from(
     cfd_log: RawFd,
     m: &Mount,
@@ -929,7 +920,7 @@ fn create_devices(devices: &[LinuxDevice], bind: bool) -> Result<()> {
     for dev in DEFAULT_DEVICES.iter() {
         let dev_path = dev.path().display().to_string();
         let path = Path::new(&dev_path[1..]);
-        op(dev, path).context(format!("Creating container device {:?}", dev))?;
+        op(dev, path).context(format!("Creating container device {dev:?}"))?;
     }
     for dev in devices {
         let dev_path = &dev.path();
@@ -941,9 +932,9 @@ fn create_devices(devices: &[LinuxDevice], bind: bool) -> Result<()> {
             anyhow!(msg)
         })?;
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).context(format!("Creating container device {:?}", dev))?;
+            fs::create_dir_all(dir).context(format!("Creating container device {dev:?}"))?;
         }
-        op(dev, path).context(format!("Creating container device {:?}", dev))?;
+        op(dev, path).context(format!("Creating container device {dev:?}"))?;
     }
     stat::umask(old);
     Ok(())

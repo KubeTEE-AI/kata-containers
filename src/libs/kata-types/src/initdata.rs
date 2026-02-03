@@ -145,7 +145,7 @@ fn calculate_digest(algorithm: &str, data: &str) -> Result<Vec<u8>> {
             hasher.update(data);
             hasher.finalize().to_vec()
         }
-        _ => return Err(anyhow!("unsupported Hash algorithm: {}", algorithm)),
+        _ => return Err(anyhow!("unsupported Hash algorithm: {algorithm}")),
     };
 
     Ok(digest)
@@ -366,8 +366,8 @@ key = "value"
 
         let result = add_hypervisor_initdata_overrides(&encoded);
         // This might fail depending on whether algorithm is required
-        if result.is_err() {
-            assert!(result.unwrap_err().to_string().contains("parse initdata"));
+        if let Err(error) = result {
+            assert!(error.to_string().contains("parse initdata"));
         }
     }
 
@@ -386,8 +386,8 @@ key = "value"
 
         let result = add_hypervisor_initdata_overrides(&encoded);
         // This might fail depending on whether version is required
-        if result.is_err() {
-            assert!(result.unwrap_err().to_string().contains("parse initdata"));
+        if let Err(error) = result {
+            assert!(error.to_string().contains("parse initdata"));
         }
     }
 
@@ -488,7 +488,7 @@ key = "value"
         let valid_toml = r#"
             version = "0.1.0"
             algorithm = "sha384"
-            
+
             [data]
             valid_key = "valid_value"
         "#;
@@ -497,7 +497,7 @@ key = "value"
         // Invalid TOML (missing version)
         let invalid_toml = r#"
             algorithm = "sha256"
-            
+
             [data]
             key = "value"
         "#;

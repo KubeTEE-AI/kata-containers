@@ -12,7 +12,12 @@ name: Build checks
 jobs:
   check:
     name: check
-    runs-on: ${{ inputs.instance }}
+    runs-on: >-
+      ${{
+        ( contains(inputs.instance, 's390x') && matrix.component.name == 'runtime' ) && 's390x' ||
+        ( contains(inputs.instance, 'ppc64le') && (matrix.component.name == 'runtime' || matrix.component.name == 'agent') ) && 'ppc64le' ||
+        inputs.instance
+      }}
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +73,8 @@ jobs:
             needs:
               - rust
               - protobuf-compiler
+        instance:
+          - ${{ inputs.instance }} 
 
     steps:
       - name: Adjust a permission for repo

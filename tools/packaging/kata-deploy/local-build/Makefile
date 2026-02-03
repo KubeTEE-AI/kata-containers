@@ -27,6 +27,7 @@ BASE_TARBALLS = serial-targets \
 	kernel-tarball \
 	nydus-tarball \
 	ovmf-sev-tarball \
+	ovmf-tdx-tarball \
 	ovmf-tarball \
 	qemu-snp-experimental-tarball \
 	qemu-tdx-experimental-tarball \
@@ -156,6 +157,9 @@ nydus-tarball:
 ovmf-sev-tarball:
 	${MAKE} $@-build
 
+ovmf-tdx-tarball:
+	${MAKE} $@-build
+
 ovmf-cca-tarball:
 	${MAKE} $@-build
 
@@ -195,8 +199,6 @@ rootfs-initrd-confidential-tarball: agent-tarball pause-image-tarball coco-guest
 rootfs-initrd-tarball: agent-tarball
 	${MAKE} $@-build
 
-runk-tarball: copy-scripts-for-the-tools-build
-	${MAKE} $@-build
 rootfs-image-nvidia-gpu-tarball: agent-tarball busybox-tarball kernel-nvidia-gpu-tarball
 	${MAKE} $@-build
 

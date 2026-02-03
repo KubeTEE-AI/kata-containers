@@ -89,11 +89,23 @@ function handle_error() {
 trap 'handle_error $LINENO' ERR
 
 # A wrapper function for kubectl with retry logic
-# runs the command up to 5 times with a 15-second interval
+# runs the command up to 5 times with a 15-second interval by default
 # to ensure successful execution
+# Usage:
+#   kubectl_retry [max_tries] [interval] kubectl_args...
+#   kubectl_retry kubectl_args...  (uses defaults: 5 retries, 15s interval)
+#   kubectl_retry 10 30 kubectl_args...  (uses 10 retries, 30s interval)
 function kubectl_retry() {
 	local max_tries=5
 	local interval=15
+
+	# Check if first two arguments are numbers (for max_tries and interval)
+	if [[ "${1}" =~ ^[0-9]+$ ]] && [[ "${2}" =~ ^[0-9]+$ ]]; then
+		max_tries="${1}"
+		interval="${2}"
+		shift 2
+	fi
+
 	local i=0
 	while true; do
 		kubectl "$@" && return 0 || true
@@ -111,6 +123,24 @@ function waitForProcess() {
 	while [ "$wait_time" -gt 0 ]; do
 		if eval "$cmd"; then
 			return 0
+		else
+			sleep "$sleep_time"
+			wait_time=$((wait_time-sleep_time))
+		fi
+	done
+	return 1
+}
+
+function waitForCmdWithAbortCmd() {
+	wait_time="$1"
+	sleep_time="$2"
+	cmd="$3"
+	abort_cmd="$4"
+	while [ "$wait_time" -gt 0 ]; do
+		if eval "$cmd"; then
+			return 0
+		elif eval "$abort_cmd"; then
+			return 1
 		else
 			sleep "$sleep_time"
 			wait_time=$((wait_time-sleep_time))
@@ -427,31 +457,42 @@ log_level = "debug"
 EOF
 }
 
-function install_kata_core() {
-	declare -r katadir="$1"
+function install_tarball() {
+	declare -r installed_dir="${1}"
+	declare -r tarball_dir="${2}"
+	declare -r tarball="${3}"
+	declare -r remove_tarball_dir="${4}"
 	declare -r destdir="/"
-	declare -r kata_tarball="kata-static.tar.zst"
 
-	# Removing previous kata installation
-	sudo rm -rf "${katadir}"
+	if [[ "${remove_tarball_dir}" == "true" ]]; then
+		# Removing previous tarball installation
+		sudo rm -rf "${installed_dir}"
+	fi
 
-	pushd "${kata_tarball_dir}"
-	sudo tar --zstd -xvf "${kata_tarball}" -C "${destdir}"
+	pushd "${tarball_dir}"
+	sudo tar --zstd -xvf "${tarball}" -C "${destdir}"
 	popd
 }
 
 function install_kata_tools() {
 	declare -r katadir="/opt/kata"
+	declare -r tarballdir="${1:-kata-tools-artifacts}"
+	declare -r local_bin_dir="/usr/local/bin/"
 
-	# TODO: implement a better way to install the tools - see issue #8864.
-	install_kata_core "${katadir}"
+	install_tarball "${katadir}" "${tarballdir}" "kata-tools-static.tar.zst" false
+
+	# create symbolic links to kata-tools components
+	for b in "${katadir}"/bin/* ; do
+		sudo ln -sf "${b}" "${local_bin_dir}/$(basename $b)"
+	done
 }
 
 function install_kata() {
 	declare -r katadir="/opt/kata"
+	declare -r tarballdir="kata-artifacts"
 	declare -r local_bin_dir="/usr/local/bin/"
 
-	install_kata_core "${katadir}"
+	install_tarball "${katadir}" "${tarballdir}" "kata-static.tar.zst" true
 
 	# create symbolic links to kata components
 	for b in "${katadir}"/bin/* ; do
@@ -603,7 +644,8 @@ function download_github_project_tarball() {
 	version="${2}"
 	tarball_name="${3}"
 
-	wget https://github.com/${project}/releases/download/${version}/${tarball_name}
+	wget ${GH_TOKEN:+--header="Authorization: Bearer ${GH_TOKEN}"} \
+		"https://github.com/${project}/releases/download/${version}/${tarball_name}"
 }
 
 # version: The version to be intalled
@@ -979,4 +1021,114 @@ function version_greater_than_equal() {
 	else
 		return 1
 	fi
+}
+
+# Run bats tests with proper reporting
+#
+# This function provides consistent test execution and reporting across
+# all test suites (k8s, nvidia, kata-deploy, etc.)
+#
+# Parameters:
+#	$1 - Test directory (where tests are located and reports will be saved)
+#	$2 - Array name containing test files (passed by reference)
+#
+# Environment variables:
+#	BATS_TEST_FAIL_FAST - Set to "yes" to stop at first failure (default: "no")
+#
+# Example usage:
+#	tests=("test1.bats" "test2.bats")
+#	run_bats_tests "/path/to/tests" tests
+#
+function run_bats_tests() {
+	local test_dir="$1"
+	local -n test_array=$2
+	local fail_fast="${BATS_TEST_FAIL_FAST:-no}"
+
+	local report_dir="${test_dir}/reports/$(date +'%F-%T')"
+	mkdir -p "${report_dir}"
+
+	info "Running tests with bats version: $(bats --version). Save outputs to ${report_dir}"
+
+	local tests_fail=()
+	for test_entry in "${test_array[@]}"; do
+		test_entry=$(echo "${test_entry}" | tr -d '[:space:][:cntrl:]')
+		[ -z "${test_entry}" ] && continue
+
+		info "Executing ${test_entry}"
+
+		# Output file will be prefixed with "ok" or "not_ok" based on the result
+		local out_file="${report_dir}/${test_entry}.out"
+
+		pushd "${test_dir}" > /dev/null
+		if ! bats --timing --show-output-of-passing-tests "${test_entry}" | tee "${out_file}"; then
+			tests_fail+=("${test_entry}")
+			mv "${out_file}" "$(dirname "${out_file}")/not_ok-$(basename "${out_file}")"
+			[[ "${fail_fast}" == "yes" ]] && break
+		else
+			mv "${out_file}" "$(dirname "${out_file}")/ok-$(basename "${out_file}")"
+		fi
+		popd > /dev/null
+	done
+
+	if [[ ${#tests_fail[@]} -ne 0 ]]; then
+		die "Tests FAILED from suites: ${tests_fail[*]}"
+	fi
+
+	info "All tests SUCCEEDED"
+}
+
+# Report bats test results from the reports directory
+#
+# This function displays a summary of test results and outputs from
+# the reports directory created by run_bats_tests().
+#
+# Parameters:
+#	$1 - Test directory (where reports subdirectory is located)
+#
+# Example usage:
+#	report_bats_tests "/path/to/tests"
+#
+function report_bats_tests() {
+	local test_dir="$1"
+	local reports_dir="${test_dir}/reports"
+
+	if [[ ! -d "${reports_dir}" ]]; then
+		warn "No reports directory found: ${reports_dir}"
+		return 1
+	fi
+
+	for report_dir in "${reports_dir}"/*; do
+		[[ ! -d "${report_dir}" ]] && continue
+
+		local ok=()
+		local not_ok=()
+		mapfile -t ok < <(find "${report_dir}" -name "ok-*.out" 2>/dev/null)
+		mapfile -t not_ok < <(find "${report_dir}" -name "not_ok-*.out" 2>/dev/null)
+
+		cat <<-EOF
+		SUMMARY ($(basename "${report_dir}")):
+		 Pass:  ${#ok[*]}
+		 Fail:  ${#not_ok[*]}
+		EOF
+
+		echo -e "\nSTATUSES:"
+		for out in "${not_ok[@]}" "${ok[@]}"; do
+			[[ -z "${out}" ]] && continue
+			local status
+			local bats
+			status=$(basename "${out}" | cut -d '-' -f1)
+			bats=$(basename "${out}" | cut -d '-' -f2- | sed 's/.out$//')
+			echo " ${status} ${bats}"
+		done
+
+		echo -e "\nOUTPUTS:"
+		for out in "${not_ok[@]}" "${ok[@]}"; do
+			[[ -z "${out}" ]] && continue
+			local bats
+			bats=$(basename "${out}" | cut -d '-' -f2- | sed 's/.out$//')
+			echo "::group::${bats}"
+			cat "${out}"
+			echo "::endgroup::"
+		done
+	done
 }

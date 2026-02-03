@@ -265,7 +265,7 @@ new_pod_config() {
 	# The runtimeclass is not optional.
 	[ -n "$runtimeclass" ] || return 1
 
-	new_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${base_config}").XXX")
+	new_config=$(mktemp "${BATS_FILE_TMPDIR}/pod-config.XXXXXX.yaml")
 	IMAGE="$image" RUNTIMECLASS="$runtimeclass" envsubst < "$base_config" > "$new_config"
 
 	echo "$new_config"
@@ -323,11 +323,12 @@ set_container_command() {
 	local container_idx="${2}"
 	shift 2
 
-    for command_value in "$@"; do
-        yq -i \
-          '.spec.containers['"${container_idx}"'].command += ["'"${command_value}"'"]' \
-          "${yaml}"
-    done
+	echo "YAML file: ${yaml}, and setting container[${container_idx}] command to: $*"
+
+	# Set the full command array once (yq v4 syntax)
+	local arr
+	arr="$(printf '"%s",' "$@" | sed 's/,$//')"
+	yq -i e ".spec.containers[${container_idx}].command = [${arr}]" "${yaml}"
 }
 
 # Set the node name on configuration spec.
@@ -380,3 +381,4 @@ get_node_kata_sandbox_id() {
 	done
 	echo $kata_sandbox_id
 }
+

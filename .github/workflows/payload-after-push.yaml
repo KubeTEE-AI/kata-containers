@@ -97,7 +97,7 @@ jobs:
       repo: kata-containers/kata-deploy-ci
       tag: kata-containers-latest-arm64
       target-branch: ${{ github.ref_name }}
-      runner: ubuntu-22.04-arm
+      runner: ubuntu-24.04-arm
       arch: arm64
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
@@ -131,7 +131,7 @@ jobs:
       repo: kata-containers/kata-deploy-ci
       tag: kata-containers-latest-ppc64le
       target-branch: ${{ github.ref_name }}
-      runner: ppc64le-small
+      runner: ubuntu-24.04-ppc64le
       arch: ppc64le
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
@@ -195,6 +195,7 @@ jobs:
           yq eval '.image.reference = "quay.io/kata-containers/kata-deploy-ci" | .image.tag = "kata-containers-latest"' -i tools/packaging/kata-deploy/helm-chart/kata-deploy/values.yaml
 
           echo "Generating the chart package"
+          helm dependencies update tools/packaging/kata-deploy/helm-chart/kata-deploy
           helm package tools/packaging/kata-deploy/helm-chart/kata-deploy
 
           echo "Pushing the chart to the OCI registries"

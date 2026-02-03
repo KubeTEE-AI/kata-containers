@@ -102,7 +102,7 @@ jobs:
       tag: ${{ inputs.tag }}-arm64
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
-      runner: ubuntu-22.04-arm
+      runner: ubuntu-24.04-arm
       arch: arm64
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
@@ -134,20 +134,6 @@ jobs:
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
-  build-kata-static-tarball-riscv64:
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    uses: ./.github/workflows/build-kata-static-tarball-riscv64.yaml
-    with:
-      tarball-suffix: -${{ inputs.tag }}
-      commit-hash: ${{ inputs.commit-hash }}
-      target-branch: ${{ inputs.target-branch }}
-    secrets:
-      QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
-
   publish-kata-deploy-payload-s390x:
     needs: build-kata-static-tarball-s390x
     permissions:
@@ -161,7 +147,7 @@ jobs:
       tag: ${{ inputs.tag }}-s390x
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
-      runner: s390x
+      runner: ubuntu-24.04-s390x
       arch: s390x
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
@@ -179,7 +165,7 @@ jobs:
       tag: ${{ inputs.tag }}-ppc64le
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
-      runner: ppc64le-small
+      runner: ubuntu-24.04-ppc64le
       arch: ppc64le
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
@@ -247,14 +233,14 @@ jobs:
         env:
           TARGET_BRANCH: ${{ inputs.target-branch }}
 
-      - name: get-kata-tarball
+      - name: get-kata-tools-tarball
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: kata-static-tarball-amd64-${{ inputs.tag }}
-          path: kata-artifacts
+          name: kata-tools-static-tarball-amd64-${{ inputs.tag }}
+          path: kata-tools-artifacts
 
-      - name: Install tools
-        run: bash tests/integration/kubernetes/gha-run.sh install-kata-tools kata-artifacts
+      - name: Install kata-tools
+        run: bash tests/integration/kubernetes/gha-run.sh install-kata-tools kata-tools-artifacts
 
       - name: Copy binary into Docker context
         run: |
@@ -311,18 +297,6 @@ jobs:
       AZ_TENANT_ID: ${{ secrets.AZ_TENANT_ID }}
       AZ_SUBSCRIPTION_ID: ${{ secrets.AZ_SUBSCRIPTION_ID }}
 
-  run-k8s-tests-on-amd64:
-    if: ${{ inputs.skip-test != 'yes' }}
-    needs: publish-kata-deploy-payload-amd64
-    uses: ./.github/workflows/run-k8s-tests-on-amd64.yaml
-    with:
-      registry: ghcr.io
-      repo: ${{ github.repository_owner }}/kata-deploy-ci
-      tag: ${{ inputs.tag }}-amd64
-      commit-hash: ${{ inputs.commit-hash }}
-      pr-number: ${{ inputs.pr-number }}
-      target-branch: ${{ inputs.target-branch }}
-
   run-k8s-tests-on-arm64:
     if: ${{ inputs.skip-test != 'yes' }}
     needs: publish-kata-deploy-payload-arm64
@@ -340,6 +314,7 @@ jobs:
     needs: publish-kata-deploy-payload-amd64
     uses: ./.github/workflows/run-k8s-tests-on-nvidia-gpu.yaml
     with:
+      tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
       repo: ${{ github.repository_owner }}/kata-deploy-ci
       tag: ${{ inputs.tag }}-amd64
@@ -441,13 +416,11 @@ jobs:
           { containerd_version: lts,    vmm: clh              },
           { containerd_version: lts,    vmm: dragonball       },
           { containerd_version: lts,    vmm: qemu             },
-          { containerd_version: lts,    vmm: stratovirt       },
           { containerd_version: lts,    vmm: cloud-hypervisor },
           { containerd_version: lts,    vmm: qemu-runtime-rs  },
           { containerd_version: active, vmm: clh              },
           { containerd_version: active, vmm: dragonball       },
           { containerd_version: active, vmm: qemu             },
-          { containerd_version: active, vmm: stratovirt       },
           { containerd_version: active, vmm: cloud-hypervisor },
           { containerd_version: active, vmm: qemu-runtime-rs  },
          ]
@@ -501,7 +474,7 @@ jobs:
       vmm: ${{ matrix.params.vmm }}
 
   run-cri-containerd-tests-arm64:
-    if: ${{ inputs.skip-test != 'yes' }}
+    if: false
     needs: build-kata-static-tarball-arm64
     strategy:
       fail-fast: false

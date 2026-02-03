@@ -33,9 +33,9 @@ export ITA_KEY="${ITA_KEY:-}"
 export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-}}"
 export NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
 export PULL_TYPE="${PULL_TYPE:-default}"
-export AUTO_GENERATE_POLICY="${AUTO_GENERATE_POLICY:-no}"
 export TEST_CLUSTER_NAMESPACE="${TEST_CLUSTER_NAMESPACE:-kata-containers-k8s-tests}"
 export GENPOLICY_PULL_METHOD="${GENPOLICY_PULL_METHOD:-oci-distribution}"
+export TARGET_ARCH="${TARGET_ARCH:-x86_64}"
 
 function configure_devmapper() {
 	sudo mkdir -p /var/lib/containerd/devmapper
@@ -201,17 +201,24 @@ function deploy_kata() {
 		case "${SNAPSHOTTER}" in
 			nydus|erofs)
 				ARCH="$(uname -m)"
-				# We only want to tests this for the qemu-coco-dev runtime class
-				# as it's running on a GitHub runner (and not on a BM machine),
+				# We only want to tests this for the qemu-coco-dev and
+				# qemu-coco-dev-runtime-rs runtime classes
+				# as they are running on a GitHub runner (and not on a BM machine),
 				# and there the snapshotter is deployed on every run (rather than
 				# deployed when the machine is configured, as on the BM machines).
-				if [[ "${KATA_HYPERVISOR}" == "qemu-coco-dev" ]] && [[ ${ARCH} == "x86_64" ]]; then
+				if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && [[ ${ARCH} == "x86_64" ]]; then
 					EXPERIMENTAL_SETUP_SNAPSHOTTER="${SNAPSHOTTER}"
 				fi
 				;;
 			*) ;;
 		esac
 	fi
+
+	EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL:-}"
+	if [[ "${KATA_HYPERVISOR}" == "qemu-nvidia-gpu-"* ]]; then
+		EXPERIMENTAL_FORCE_GUEST_PULL="${KATA_HYPERVISOR}"
+	fi
+	export EXPERIMENTAL_FORCE_GUEST_PULL
 
 	export HELM_K8S_DISTRIBUTION="${KUBERNETES}"
 	export HELM_IMAGE_REFERENCE="${DOCKER_REGISTRY}/${DOCKER_REPO}"
@@ -226,7 +233,7 @@ function deploy_kata() {
 	export HELM_AGENT_NO_PROXY="${NO_PROXY}"
 	export HELM_PULL_TYPE_MAPPING="${PULL_TYPE_MAPPING}"
 	export HELM_EXPERIMENTAL_SETUP_SNAPSHOTTER="${EXPERIMENTAL_SETUP_SNAPSHOTTER}"
-	export HELM_EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL:-false}"
+	export HELM_EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL}"
 	export HELM_HOST_OS="${HOST_OS}"
 	helm_helper
 }
@@ -319,41 +326,7 @@ function run_tests() {
 # directory.
 #
 function report_tests() {
-	local reports_dir="${kubernetes_dir}/reports"
-	local ok
-	local not_ok
-	local status
-
-	if [[ ! -d "${reports_dir}" ]]; then
-		info "no reports directory found: ${reports_dir}"
-		return
-	fi
-
-	for report_dir in "${reports_dir}"/*; do
-		mapfile -t ok < <(find "${report_dir}" -name "ok-*.out")
-		mapfile -t not_ok < <(find "${report_dir}" -name "not_ok-*.out")
-
-		cat <<-EOF
-		SUMMARY ($(basename "${report_dir}")):
-		 Pass:  ${#ok[*]}
-		 Fail:  ${#not_ok[*]}
-		EOF
-
-		echo -e "\nSTATUSES:"
-		for out in "${not_ok[@]}" "${ok[@]}"; do
-			status=$(basename "${out}" | cut -d '-' -f1)
-			bats=$(basename "${out}" | cut -d '-' -f2- | sed 's/.out$//')
-			echo " ${status} ${bats}"
-		done
-
-		echo -e "\nOUTPUTS:"
-		for out in "${not_ok[@]}" "${ok[@]}"; do
-			bats=$(basename "${out}" | cut -d '-' -f2- | sed 's/.out$//')
-			echo "::group::${bats}"
-			cat "${out}"
-			echo "::endgroup::"
-		done
-	done
+	report_bats_tests "${kubernetes_dir}"
 }
 
 function collect_artifacts() {
@@ -582,17 +555,34 @@ function main() {
 	export KATA_HOST_OS="${KATA_HOST_OS:-}"
 	export K8S_TEST_HOST_TYPE="${K8S_TEST_HOST_TYPE:-}"
 
+	AUTO_GENERATE_POLICY="${AUTO_GENERATE_POLICY:-}"
+
+	# Auto-generate policy on some Host types, if the caller didn't specify an AUTO_GENERATE_POLICY value.
+	if [[ -z "${AUTO_GENERATE_POLICY}" ]]; then
+		if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
+			AUTO_GENERATE_POLICY="yes"
+		elif [[ "${KATA_HYPERVISOR}" = qemu-coco-dev* && \
+		        "${TARGET_ARCH}" = "x86_64" && \
+		        "${PULL_TYPE}" != "experimental-force-guest-pull" ]]; then
+			AUTO_GENERATE_POLICY="yes"
+		elif [[ "${KATA_HYPERVISOR}" = qemu-nvidia-gpu-* ]]; then
+			AUTO_GENERATE_POLICY="yes"
+		fi
+	fi
+
+	info "Exporting AUTO_GENERATE_POLICY=${AUTO_GENERATE_POLICY}"
+	export AUTO_GENERATE_POLICY
+
 	action="${1:-}"
 
 	case "${action}" in
 		create-cluster) create_cluster "" ;;
 		create-cluster-kcli) create_cluster_kcli ;;
 		configure-snapshotter) configure_snapshotter ;;
-		setup-crio) setup_crio ;;
 		deploy-coco-kbs) deploy_coco_kbs ;;
 		deploy-k8s) deploy_k8s ${CONTAINER_ENGINE:-} ${CONTAINER_ENGINE_VERSION:-};;
 		install-bats) install_bats ;;
-		install-kata-tools) install_kata_tools ;;
+		install-kata-tools) install_kata_tools "${2:-}" ;;
 		install-kbs-client) install_kbs_client ;;
 		get-cluster-credentials) get_cluster_credentials "" ;;
 		deploy-csi-driver) return 0 ;;

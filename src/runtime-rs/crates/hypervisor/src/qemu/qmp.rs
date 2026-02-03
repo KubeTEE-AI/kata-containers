@@ -12,6 +12,12 @@ use anyhow::{anyhow, Context, Result};
 use kata_types::config::hypervisor::VIRTIO_SCSI;
 use kata_types::rootless::is_rootless;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use qapi_qmp::{
+    self as qmp, BlockdevAioOptions, BlockdevOptions, BlockdevOptionsBase,
+    BlockdevOptionsGenericFormat, BlockdevOptionsRaw, BlockdevRef, MigrationInfo, PciDeviceInfo,
+};
+use qapi_qmp::{migrate, migrate_incoming, migrate_set_capabilities};
+use qapi_qmp::{MigrationCapability, MigrationCapabilityStatus};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
@@ -21,14 +27,14 @@ use std::os::unix::net::UnixStream;
 use std::str::FromStr;
 use std::time::Duration;
 
-use qapi_qmp::{
-    self as qmp, BlockdevAioOptions, BlockdevOptions, BlockdevOptionsBase,
-    BlockdevOptionsGenericFormat, BlockdevOptionsRaw, BlockdevRef, PciDeviceInfo,
-};
 use qapi_spec::Dictionary;
+use std::thread;
+use std::time::Instant;
 
 /// default qmp connection read timeout
 const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
+const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 5000;
+const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
 
 pub struct Qmp {
     qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
@@ -57,29 +63,84 @@ impl Debug for Qmp {
 
 impl Qmp {
     pub fn new(qmp_sock_path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(qmp_sock_path)?;
+        let try_new_once_fn = || -> Result<Qmp> {
+            let stream = UnixStream::connect(qmp_sock_path)?;
 
-        // Set the read timeout to protect runtime-rs from blocking forever
-        // trying to set up QMP connection if qemu fails to launch.  The exact
-        // value is a matter of judegement.  Setting it too long would risk
-        // being ineffective since container runtime would timeout first anyway
-        // (containerd's task creation timeout is 2 s by default).  OTOH
-        // setting it too short would risk interfering with a normal launch,
-        // perhaps just seeing some delay due to a heavily loaded host.
-        stream.set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))?;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))
+                .context("set qmp read timeout")?;
 
-        let mut qmp = Qmp {
-            qmp: qapi::Qmp::new(qapi::Stream::new(
-                BufReader::new(stream.try_clone()?),
-                stream,
-            )),
-            guest_memory_block_size: 0,
+            let mut qmp = Qmp {
+                qmp: qapi::Qmp::new(qapi::Stream::new(
+                    BufReader::new(stream.try_clone()?),
+                    stream,
+                )),
+                guest_memory_block_size: 0,
+            };
+
+            let info = qmp.qmp.handshake().context("qmp handshake failed")?;
+            info!(sl!(), "QMP initialized: {:#?}", info);
+
+            Ok(qmp)
         };
 
-        let info = qmp.qmp.handshake()?;
-        info!(sl!(), "QMP initialized: {:#?}", info);
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_QMP_CONNECT_DEADLINE_MS);
+        let mut last_err: Option<anyhow::Error> = None;
 
-        Ok(qmp)
+        while Instant::now() < deadline {
+            match try_new_once_fn() {
+                Ok(qmp) => return Ok(qmp),
+                Err(e) => {
+                    debug!(sl!(), "QMP not ready yet: {}", e);
+                    last_err = Some(e);
+                    thread::sleep(Duration::from_millis(DEFAULT_QMP_RETRY_SLEEP_MS));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("QMP init timed out")))
+            .with_context(|| format!("timed out waiting for QMP ready: {}", qmp_sock_path))
+    }
+
+    pub fn set_ignore_shared_memory_capability(&mut self) -> Result<()> {
+        self.qmp
+            .execute(&migrate_set_capabilities {
+                capabilities: vec![MigrationCapabilityStatus {
+                    capability: MigrationCapability::x_ignore_shared,
+                    state: true,
+                }],
+            })
+            .map(|_| ())
+            .context("set ignore shared memory capability")
+    }
+
+    pub fn execute_migration(&mut self, uri: &str) -> Result<()> {
+        self.qmp
+            .execute(&migrate {
+                channels: None,
+                detach: None,
+                resume: None,
+                uri: Some(uri.to_string()),
+            })
+            .map(|_| ())
+            .context("execute migration")
+    }
+
+    pub async fn execute_query_migrate(&mut self) -> Result<MigrationInfo> {
+        let migrate_info = self.qmp.execute(&qmp::query_migrate {})?;
+
+        Ok(migrate_info)
+    }
+
+    pub fn execute_migration_incoming(&mut self, uri: &str) -> Result<()> {
+        self.qmp
+            .execute(&migrate_incoming {
+                channels: None,
+                exit_on_error: None,
+                uri: Some(uri.to_string()),
+            })
+            .map(|_| ())
+            .context("execute migration incoming")
     }
 
     pub fn hotplug_vcpus(&mut self, vcpu_cnt: u32) -> Result<u32> {
@@ -211,7 +272,7 @@ impl Qmp {
             })
             .count();
 
-        let memory_backend_id = format!("hotplugged-{}", memdev_idx);
+        let memory_backend_id = format!("hotplugged-{memdev_idx}");
 
         let memory_backend = qmp::object_add(qapi_qmp::ObjectOptions::memory_backend_file {
             id: memory_backend_id.clone(),
@@ -235,11 +296,12 @@ impl Qmp {
                 pmem: None,
                 readonly: None,
                 mem_path: "/dev/shm".to_owned(),
+                rom: None,
             },
         });
         self.qmp.execute(&memory_backend)?;
 
-        let memory_frontend_id = format!("frontend-to-{}", memory_backend_id);
+        let memory_frontend_id = format!("frontend-to-{memory_backend_id}");
 
         let mut mem_frontend_args = Dictionary::new();
         mem_frontend_args.insert("memdev".to_owned(), memory_backend_id.into());
@@ -336,7 +398,7 @@ impl Qmp {
                     // from virtcontainers' bridges.go
                     let pci_bridge_max_capacity = 30;
                     for slot in 0..pci_bridge_max_capacity {
-                        if !occupied_slots.iter().any(|elem| *elem == slot) {
+                        if !occupied_slots.contains(&slot) {
                             info!(
                                 sl!(),
                                 "found free slot on bridge {}: {}", pci_dev.qdev_id, slot
@@ -354,10 +416,8 @@ impl Qmp {
         info!(sl!(), "passing fd {:?} as {}", fd, fdname);
 
         // Put the QMP 'getfd' command itself into the message payload.
-        let getfd_cmd = format!(
-            "{{ \"execute\": \"getfd\", \"arguments\": {{ \"fdname\": \"{}\" }} }}",
-            fdname
-        );
+        let getfd_cmd =
+            format!("{{ \"execute\": \"getfd\", \"arguments\": {{ \"fdname\": \"{fdname}\" }} }}");
         let buf = getfd_cmd.as_bytes();
         let bufs = &mut [std::io::IoSlice::new(buf)][..];
 
@@ -402,14 +462,14 @@ impl Qmp {
 
         let mut fd_names = vec![];
         for (idx, fd) in netdev.get_fds().iter().enumerate() {
-            let fdname = format!("fd{}", idx);
+            let fdname = format!("fd{idx}");
             self.pass_fd(fd.as_raw_fd(), fdname.as_ref())?;
             fd_names.push(fdname);
         }
 
         let mut vhostfd_names = vec![];
         for (idx, fd) in netdev.get_vhostfds().iter().enumerate() {
-            let vhostfdname = format!("vhostfd{}", idx);
+            let vhostfdname = format!("vhostfd{idx}");
             self.pass_fd(fd.as_raw_fd(), vhostfdname.as_ref())?;
             vhostfd_names.push(vhostfdname);
         }
@@ -451,9 +511,9 @@ impl Qmp {
             "netdev".to_owned(),
             virtio_net_device.get_netdev_id().clone().into(),
         );
-        netdev_frontend_args.insert("addr".to_owned(), format!("{:02}", slot).into());
+        netdev_frontend_args.insert("addr".to_owned(), format!("{slot:02}").into());
         netdev_frontend_args.insert("mac".to_owned(), virtio_net_device.get_mac_addr().into());
-        netdev_frontend_args.insert("mq".to_owned(), "on".into());
+        netdev_frontend_args.insert("mq".to_owned(), true.into());
         // As the golang runtime documents the vectors computation, it's
         // 2N+2 vectors, N for tx queues, N for rx queues, 1 for config, and one for possible control vq
         netdev_frontend_args.insert(
@@ -484,7 +544,7 @@ impl Qmp {
     pub fn get_device_by_qdev_id(&mut self, qdev_id: &str) -> Result<PciPath> {
         let format_str = |vec: &Vec<i64>| -> String {
             vec.iter()
-                .map(|num| format!("{:02x}", num))
+                .map(|num| format!("{num:02x}"))
                 .collect::<Vec<String>>()
                 .join("/")
         };
@@ -631,7 +691,7 @@ impl Qmp {
 
             // Safely convert the u64 index to u16, ensuring it does not exceed `u16::MAX` (65535).
             let (scsi_id, lun) = get_scsi_id_lun(u16::try_from(index)?)?;
-            let scsi_addr = format!("{}:{}", scsi_id, lun);
+            let scsi_addr = format!("{scsi_id}:{lun}");
 
             // add SCSI frontend device
             blkdev_add_args.insert("scsi-id".to_string(), scsi_id.into());
@@ -656,7 +716,7 @@ impl Qmp {
             Ok((None, Some(scsi_addr)))
         } else {
             let (bus, slot) = self.find_free_slot()?;
-            blkdev_add_args.insert("addr".to_owned(), format!("{:02}", slot).into());
+            blkdev_add_args.insert("addr".to_owned(), format!("{slot:02}").into());
             blkdev_add_args.insert("share-rw".to_string(), true.into());
 
             self.qmp
@@ -684,25 +744,41 @@ impl Qmp {
     pub fn hotplug_vfio_device(
         &mut self,
         hostdev_id: &str,
+        sysfs_path: &str,
         bus_slot_func: &str,
         driver: &str,
         bus: &str,
     ) -> Result<Option<PciPath>> {
         let mut vfio_args = Dictionary::new();
-        let bdf = if !bus_slot_func.starts_with("0000") {
-            format!("0000:{}", bus_slot_func)
-        } else {
-            bus_slot_func.to_owned()
-        };
-        vfio_args.insert("addr".to_owned(), "0x0".into());
-        vfio_args.insert("host".to_owned(), bdf.into());
-        vfio_args.insert("multifunction".to_owned(), "off".into());
 
-        let vfio_device_add = qmp::device_add {
-            driver: driver.to_string(),
-            bus: Some(bus.to_string()),
-            id: Some(hostdev_id.to_string()),
-            arguments: vfio_args,
+        let (vfio_device_add, early_return) = match driver {
+            "vfio-ap" => {
+                vfio_args.insert("sysfsdev".to_owned(), sysfs_path.to_string().into());
+                let device_add = qmp::device_add {
+                    driver: driver.to_string(),
+                    bus: None,
+                    id: Some(hostdev_id.to_string()),
+                    arguments: vfio_args,
+                };
+                (device_add, Some(Ok(None)))
+            }
+            _ => {
+                let bdf = if !bus_slot_func.starts_with("0000") {
+                    format!("0000:{bus_slot_func}")
+                } else {
+                    bus_slot_func.to_owned()
+                };
+                vfio_args.insert("addr".to_owned(), "0x0".into());
+                vfio_args.insert("host".to_owned(), bdf.into());
+                vfio_args.insert("multifunction".to_owned(), "off".into());
+                let device_add = qmp::device_add {
+                    driver: driver.to_string(),
+                    bus: Some(bus.to_string()),
+                    id: Some(hostdev_id.to_string()),
+                    arguments: vfio_args,
+                };
+                (device_add, None)
+            }
         };
         info!(sl!(), "vfio_device_add: {:?}", vfio_device_add.clone());
 
@@ -734,11 +810,30 @@ impl Qmp {
                 .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))?;
         }
 
+        // For AP devices, we don't need to get the PCI path as it's not available.
+        if let Some(result) = early_return {
+            return result;
+        }
+
         let pci_path = self
             .get_device_by_qdev_id(hostdev_id)
             .context("get device by qdev_id failed")?;
 
         Ok(Some(pci_path))
+    }
+
+    pub fn qmp_stop(&mut self) -> Result<()> {
+        self.qmp
+            .execute(&qmp::stop {})
+            .map(|_| ())
+            .context("execute qmp stop")
+    }
+
+    pub fn qmp_cont(&mut self) -> Result<()> {
+        self.qmp
+            .execute(&qmp::cont {})
+            .map(|_| ())
+            .context("execute qmp cont")
     }
 
     /// Get vCPU thread IDs through QMP query_cpus_fast.
@@ -766,7 +861,6 @@ impl Qmp {
                 | qmp::CpuInfoFast::mips64(cpu_info)
                 | qmp::CpuInfoFast::mips64el(cpu_info)
                 | qmp::CpuInfoFast::mipsel(cpu_info)
-                | qmp::CpuInfoFast::nios2(cpu_info)
                 | qmp::CpuInfoFast::or1k(cpu_info)
                 | qmp::CpuInfoFast::ppc(cpu_info)
                 | qmp::CpuInfoFast::ppc64(cpu_info)
@@ -798,7 +892,7 @@ impl Qmp {
 }
 
 fn vcpu_id_from_core_id(core_id: i64) -> String {
-    format!("cpu-{}", core_id)
+    format!("cpu-{core_id}")
 }
 
 // The get_pci_path_by_qdev_id function searches a device list for a device matching a given qdev_id,

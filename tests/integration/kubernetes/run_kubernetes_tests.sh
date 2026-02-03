@@ -42,6 +42,7 @@ else
 	)
 
 	K8S_TEST_SMALL_HOST_UNION=( \
+		"k8s-empty-image.bats" \
 		"k8s-guest-pull-image.bats" \
 		"k8s-confidential.bats" \
 		"k8s-sealed-secret.bats" \
@@ -86,7 +87,6 @@ else
 		"k8s-port-forward.bats" \
 		"k8s-privileged.bats" \
 		"k8s-projected-volume.bats" \
-		"k8s-qos-pods.bats" \
 		"k8s-replication.bats" \
 		"k8s-seccomp.bats" \
 		"k8s-sysctls.bats" \
@@ -99,6 +99,7 @@ else
 	K8S_TEST_NORMAL_HOST_UNION=( \
 		"k8s-number-cpus.bats" \
 		"k8s-parallel.bats" \
+		"k8s-qos-pods.bats" \
 		"k8s-sandbox-vcpus-allocation.bats" \
 		"k8s-scale-nginx.bats" \
 	)
@@ -135,28 +136,6 @@ fi
 
 ensure_yq
 
-report_dir="${kubernetes_dir}/reports/$(date +'%F-%T')"
-mkdir -p "${report_dir}"
-
-info "Running tests with bats version: $(bats --version). Save outputs to ${report_dir}"
-
-tests_fail=()
-for K8S_TEST_ENTRY in "${K8S_TEST_UNION[@]}"
-do
-	K8S_TEST_ENTRY=$(echo "$K8S_TEST_ENTRY" | tr -d '[:space:][:cntrl:]')
-	time info "$(kubectl get pods --all-namespaces 2>&1)"
-	info "Executing ${K8S_TEST_ENTRY}"
-	# Output file will be prefixed with "ok" or "not_ok" based on the result
-	out_file="${report_dir}/${K8S_TEST_ENTRY}.out"
-	if ! bats --timing --show-output-of-passing-tests "${K8S_TEST_ENTRY}" | tee "${out_file}"; then
-		tests_fail+=("${K8S_TEST_ENTRY}")
-		mv "${out_file}" "$(dirname "${out_file}")/not_ok-$(basename "${out_file}")"
-		[ "${K8S_TEST_FAIL_FAST}" = "yes" ] && break
-	else
-		mv "${out_file}" "$(dirname "${out_file}")/ok-$(basename "${out_file}")"
-	fi
-done
-
-[ ${#tests_fail[@]} -ne 0 ] && die "Tests FAILED from suites: ${tests_fail[*]}"
-
-info "All tests SUCCEEDED"
+# Use common bats test runner with proper reporting
+export BATS_TEST_FAIL_FAST="${K8S_TEST_FAIL_FAST}"
+run_bats_tests "${kubernetes_dir}" K8S_TEST_UNION

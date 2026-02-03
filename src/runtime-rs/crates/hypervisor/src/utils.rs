@@ -21,6 +21,7 @@ use kata_types::{
     build_path,
     config::{Hypervisor, KATA_PATH},
 };
+use lazy_static::lazy_static;
 use nix::{
     fcntl,
     sched::{setns, CloneFlags},
@@ -37,7 +38,7 @@ use crate::{DEFAULT_HYBRID_VSOCK_NAME, JAILER_ROOT};
 
 pub fn get_child_threads(pid: u32) -> HashSet<u32> {
     let mut result = HashSet::new();
-    let path_name = format!("/proc/{}/task", pid);
+    let path_name = format!("/proc/{pid}/task");
     let path = std::path::Path::new(path_name.as_str());
     if path.is_dir() {
         if let Ok(dir) = path.read_dir() {
@@ -139,7 +140,7 @@ pub fn open_named_tuntap(if_name: &str, queues: u32) -> Result<Vec<File>> {
 // for example: /dev/tap2381
 #[allow(dead_code)]
 pub fn create_macvtap_fds(ifindex: u32, queues: u32) -> Result<Vec<File>> {
-    let macvtap = format!("/dev/tap{}", ifindex);
+    let macvtap = format!("/dev/tap{ifindex}");
     create_fds(macvtap.as_str(), queues as usize)
 }
 
@@ -224,7 +225,7 @@ pub fn chown_to_parent<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     let parent = path
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no parent directory"))?;
+        .ok_or_else(|| io::Error::other("no parent directory"))?;
 
     let st = stat::stat(parent).map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     let uid = Uid::from_raw(st.st_uid);
@@ -347,7 +348,7 @@ impl std::fmt::Display for SocketAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         serde_json::to_string(self)
             .map_err(|_| std::fmt::Error)
-            .and_then(|s| write!(f, "{}", s))
+            .and_then(|s| write!(f, "{s}"))
     }
 }
 
@@ -357,6 +358,61 @@ pub fn bytes_to_megs(bytes: u64) -> u32 {
 
 pub fn megs_to_bytes(bytes: u32) -> u64 {
     bytes as u64 * (1 << 20)
+}
+
+#[allow(dead_code)]
+pub fn get_cmd_output(cmd: &str, args: &[&str]) -> Result<String> {
+    let mut cmd = std::process::Command::new(cmd);
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+    let result = cmd.output()?;
+    Ok(String::from_utf8(result.stdout)?)
+}
+
+// The presence of this sysfs directory is the fundamental architectural proof.
+const CCW_BUS_PATH: &str = "/sys/bus/ccw/devices";
+
+// These drivers are specific to traditional mainframe I/O and prove
+// native CCW support, even in virtualized environments.
+const NATIVE_CCW_DRIVERS: [&str; 3] = [
+    "3270",      // IBM 3270 Terminal Driver
+    "dasd-eckd", // Mainframe DASD (Disk) Driver
+    "zfcp",      // Fibre Channel Protocol Driver (FICON)
+];
+
+lazy_static! {
+    static ref NATIVE_CCW_BUS_CACHE: bool = {
+        if !Path::new(CCW_BUS_PATH).exists() {
+            false
+        } else {
+            let drivers_path = PathBuf::from("/sys/bus/ccw/drivers");
+            let mut native_driver_found = false;
+
+            for driver_name in NATIVE_CCW_DRIVERS.iter() {
+                let driver_path = drivers_path.join(driver_name);
+
+                if driver_path.exists() {
+                    native_driver_found = true;
+                    break;
+                }
+            }
+
+            native_driver_found
+        }
+    };
+}
+
+/// Detects if the system uses native CCW (Channel Command Word) bus.
+/// This function checks for the presence of CCW bus infrastructure in sysfs
+/// and verifies that native mainframe drivers are available.
+///
+/// The result is cached after the first call to avoid repeated IO operations.
+///
+/// # Returns
+/// `true` if native CCW bus is detected, `false` otherwise.
+pub fn uses_native_ccw_bus() -> bool {
+    *NATIVE_CCW_BUS_CACHE
 }
 
 #[cfg(test)]
@@ -407,7 +463,7 @@ mod tests {
     fn test_socket_address_display() {
         let socket = SocketAddress::new(6688);
         let expected_json = r#"{"type":"vsock","cid":"2","port":"6688"}"#;
-        assert_eq!(format!("{}", socket), expected_json);
+        assert_eq!(format!("{socket}"), expected_json);
     }
 
     #[test]
@@ -470,7 +526,7 @@ mod tests {
         }
 
         let tmp2 = TempDir::new().expect("create tmp2");
-        let tmp2_path = tmp2.into_path();
+        let tmp2_path = tmp2.keep();
         let _ = fs::remove_dir_all(&tmp2_path);
 
         let target2 = tmp2_path.join("foo").join("bar");

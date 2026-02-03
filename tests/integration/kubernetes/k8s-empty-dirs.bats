@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
@@ -19,9 +20,8 @@ assert_equal() {
 
 setup() {
 	pod_name="sharevol-kata"
-	get_pod_config_dir
 	pod_logs_file=""
-
+	setup_common || die "setup_common failed"
 	yaml_file="${pod_config_dir}/pod-empty-dir.yaml"
 
 	# Add policy to yaml
@@ -58,7 +58,6 @@ setup() {
 	local image
 	local logs
 	local pod_file
-	local pod_logs_file
 	local uid
 
 	[[ "${KATA_HYPERVISOR}" = qemu-se* ]] && \
@@ -100,4 +99,5 @@ teardown() {
 	[ ! -f "$pod_logs_file" ] || rm -f "$pod_logs_file"
 
 	delete_tmp_policy_settings_dir "${policy_settings_dir}"
+	teardown_common "${node}" "${node_start_time:-}"
 }

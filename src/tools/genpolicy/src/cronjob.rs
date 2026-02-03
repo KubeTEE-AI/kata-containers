@@ -54,10 +54,6 @@ pub struct CronJobSpec {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     timeZone: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backoffLimit: Option<i32>,
-    // TODO: additional fields.
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,7 +100,7 @@ impl yaml::K8sResource for CronJob {
             storages,
             container,
             settings,
-            &self.spec.jobTemplate.spec.template.spec.volumes,
+            &self.spec.jobTemplate.spec.template.spec,
         );
     }
 
@@ -153,11 +149,17 @@ impl yaml::K8sResource for CronJob {
         false
     }
 
-    fn get_process_fields(&self, process: &mut policy::KataProcess, must_check_passwd: &mut bool) {
+    fn get_process_fields(
+        &self,
+        process: &mut policy::KataProcess,
+        must_check_passwd: &mut bool,
+        is_pause_container: bool,
+    ) {
         yaml::get_process_fields(
             process,
-            &self.spec.jobTemplate.spec.template.spec.securityContext,
             must_check_passwd,
+            is_pause_container,
+            &self.spec.jobTemplate.spec.template.spec.securityContext,
         );
     }
 
