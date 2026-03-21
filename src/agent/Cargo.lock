@@ -786,7 +786,7 @@ dependencies = [
  "libc",
  "nix 0.24.3",
  "notify",
- "oci-spec",
+ "oci-spec 0.8.4",
  "once_cell",
  "path-clean",
  "regex",
@@ -2054,7 +2054,7 @@ dependencies = [
  "netlink-packet-route",
  "netlink-sys 0.7.0",
  "nix 0.26.4",
- "oci-spec",
+ "oci-spec 0.9.0",
  "opentelemetry",
  "procfs 0.12.0",
  "prometheus",
@@ -2121,7 +2121,7 @@ dependencies = [
  "libc",
  "mockall",
  "nix 0.26.4",
- "oci-spec",
+ "oci-spec 0.8.4",
  "pci-ids",
  "rand",
  "runtime-spec",
@@ -2146,7 +2146,7 @@ dependencies = [
  "lazy_static",
  "nix 0.26.4",
  "num_cpus",
- "oci-spec",
+ "oci-spec 0.8.4",
  "regex",
  "safe-path",
  "serde",
@@ -2729,9 +2729,26 @@ dependencies = [
 
 [[package]]
 name = "oci-spec"
-version = "0.8.1"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57e9beda9d92fac7bf4904c34c83340ef1024159faee67179a04e0277523da33"
+checksum = "fc3da52b83ce3258fbf29f66ac784b279453c2ac3c22c5805371b921ede0d308"
+dependencies = [
+ "const_format",
+ "derive_builder",
+ "getset",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
+ "thiserror 2.0.12",
+]
+
+[[package]]
+name = "oci-spec"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8445a2631507cec628a15fdd6154b54a3ab3f20ed4fe9d73a3b8b7a4e1ba03a"
 dependencies = [
  "const_format",
  "derive_builder",
@@ -3261,7 +3278,7 @@ name = "protocols"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "oci-spec",
+ "oci-spec 0.8.4",
  "protobuf",
  "serde",
  "serde_json",
@@ -3679,7 +3696,7 @@ dependencies = [
  "libc",
  "libseccomp",
  "nix 0.26.4",
- "oci-spec",
+ "oci-spec 0.9.0",
  "path-absolutize",
  "protobuf",
  "protocols",
