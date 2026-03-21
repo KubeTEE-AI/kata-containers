@@ -15,7 +15,6 @@ use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
 use crate::MemoryConfig;
 use crate::VM_ROOTFS_DRIVER_BLK;
-use crate::VM_ROOTFS_DRIVER_PMEM;
 use crate::{VcpuThreadIds, VmmState};
 use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
@@ -130,12 +129,8 @@ impl CloudHypervisorInner {
         let confidential_guest = cfg.security_info.confidential_guest;
 
         // Note that the configuration option hypervisor.block_device_driver is not used.
-        let rootfs_driver = if confidential_guest {
-            // PMEM is not available with TDX.
-            VM_ROOTFS_DRIVER_BLK
-        } else {
-            VM_ROOTFS_DRIVER_PMEM
-        };
+        // NVDIMM is not supported for Cloud Hypervisor.
+        let rootfs_driver = VM_ROOTFS_DRIVER_BLK;
 
         let rootfs_type = match cfg.boot_info.rootfs_type.is_empty() {
             true => DEFAULT_CH_ROOTFS_TYPE,
@@ -151,7 +146,12 @@ impl CloudHypervisorInner {
         #[cfg(target_arch = "aarch64")]
         let console_param_debug = KernelParams::from_string("console=ttyAMA0,115200n8");
 
-        let mut rootfs_param = KernelParams::new_rootfs_kernel_params(rootfs_driver, rootfs_type)?;
+        let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+            &cfg.boot_info.kernel_verity_params,
+            rootfs_driver,
+            rootfs_type,
+            true,
+        )?;
 
         let mut console_params = if enable_debug {
             if confidential_guest {
@@ -165,8 +165,7 @@ impl CloudHypervisorInner {
 
         params.append(&mut console_params);
 
-        // Add the rootfs device
-        params.append(&mut rootfs_param);
+        params.append(&mut rootfs_params);
 
         // Now add some additional options required for CH
         let extra_options = [
@@ -1101,7 +1100,7 @@ fn get_guest_protection() -> Result<GuestProtection> {
     Ok(guest_protection)
 }
 
-// Return a TID/VCPU map from a specified /proc/{pid} path.
+// Return a VCPU/TID map from a specified /proc/{pid} path.
 fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
     const VCPU_STR: &str = "vcpu";
 
@@ -1144,7 +1143,7 @@ fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
             .parse::<u32>()
             .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
 
-        vcpus.insert(tid, vcpu_id);
+        vcpus.insert(vcpu_id, tid);
     }
 
     if vcpus.is_empty() {
@@ -1609,5 +1608,66 @@ mod tests {
 
             assert!(actual_error == expected_error, "{}", msg);
         }
+    }
+
+    #[actix_rt::test]
+    async fn test_get_ch_vcpu_tids_mapping() {
+        let tmp_dir = Builder::new().prefix("fake-proc-pid").tempdir().unwrap();
+        let task_dir = tmp_dir.path().join("task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        #[derive(Debug)]
+        struct ThreadInfo<'a> {
+            tid: &'a str,
+            comm: &'a str,
+        }
+
+        let threads = &[
+            // Non-vcpu thread, should be skipped.
+            ThreadInfo {
+                tid: "1000",
+                comm: "main_thread\n",
+            },
+            ThreadInfo {
+                tid: "2001",
+                comm: "vcpu0\n",
+            },
+            ThreadInfo {
+                tid: "2002",
+                comm: "vcpu1\n",
+            },
+            ThreadInfo {
+                tid: "2003",
+                comm: "vcpu2\n",
+            },
+        ];
+
+        for t in threads {
+            let tid_dir = task_dir.join(t.tid);
+            fs::create_dir_all(&tid_dir).unwrap();
+            fs::write(tid_dir.join("comm"), t.comm).unwrap();
+        }
+
+        let proc_path = tmp_dir.path().to_str().unwrap();
+        let result = get_ch_vcpu_tids(proc_path);
+
+        let msg = format!("result: {result:?}");
+
+        if std::env::var("DEBUG").is_ok() {
+            println!("DEBUG: {msg}");
+        }
+
+        let vcpus = result.unwrap();
+
+        // The mapping must be vcpu_id -> tid.
+        assert_eq!(vcpus.len(), 3, "non-vcpu threads should be excluded");
+        assert_eq!(vcpus[&0], 2001, "vcpu 0 should map to tid 2001");
+        assert_eq!(vcpus[&1], 2002, "vcpu 1 should map to tid 2002");
+        assert_eq!(vcpus[&2], 2003, "vcpu 2 should map to tid 2003");
+
+        assert!(
+            !vcpus.contains_key(&1000),
+            "non-vcpu thread should not be in the map"
+        );
     }
 }

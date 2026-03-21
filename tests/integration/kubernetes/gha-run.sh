@@ -36,6 +36,7 @@ export PULL_TYPE="${PULL_TYPE:-default}"
 export TEST_CLUSTER_NAMESPACE="${TEST_CLUSTER_NAMESPACE:-kata-containers-k8s-tests}"
 export GENPOLICY_PULL_METHOD="${GENPOLICY_PULL_METHOD:-oci-distribution}"
 export TARGET_ARCH="${TARGET_ARCH:-x86_64}"
+export RUNS_ON_AKS="${RUNS_ON_AKS:-false}"
 
 function configure_devmapper() {
 	sudo mkdir -p /var/lib/containerd/devmapper
@@ -175,7 +176,7 @@ function deploy_kata() {
 
 	ANNOTATIONS="default_vcpus"
 	if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
-		ANNOTATIONS="image kernel default_vcpus disable_image_nvdimm cc_init_data"
+		ANNOTATIONS="image kernel default_vcpus cc_init_data"
 	fi
 	if [[ "${KATA_HYPERVISOR}" = "qemu" ]]; then
 		ANNOTATIONS="image initrd kernel default_vcpus"
@@ -405,7 +406,9 @@ function cleanup_kata_deploy() {
 
 	# Do not return after deleting only the parent object cascade=foreground
 	# means also wait for child/dependent object deletion
-	helm uninstall kata-deploy --ignore-not-found --wait --cascade foreground --timeout 10m --namespace kube-system --debug
+	helm uninstall kata-deploy --ignore-not-found --wait --cascade foreground --timeout 10m --namespace kube-system --debug || true
+
+	wait_for_api_and_retry_uninstall "kata-deploy" "kube-system"
 }
 
 function cleanup() {
@@ -584,8 +587,7 @@ function main() {
 		install-bats) install_bats ;;
 		install-kata-tools) install_kata_tools "${2:-}" ;;
 		install-kbs-client) install_kbs_client ;;
-		get-cluster-credentials) get_cluster_credentials "" ;;
-		deploy-csi-driver) return 0 ;;
+		get-cluster-credentials) get_cluster_credentials ;;
 		deploy-kata) deploy_kata ;;
 		deploy-kata-aks) deploy_kata "aks" ;;
 		deploy-kata-kcli) deploy_kata "kcli" ;;
@@ -610,7 +612,6 @@ function main() {
 		cleanup-garm) cleanup "garm" ;;
 		cleanup-zvsi) cleanup "zvsi" ;;
 		cleanup-snapshotter) cleanup_snapshotter ;;
-		delete-csi-driver) return 0 ;;
 		delete-coco-kbs) delete_coco_kbs ;;
 		delete-cluster) cleanup "aks" ;;
 		delete-cluster-kcli) delete_cluster_kcli ;;

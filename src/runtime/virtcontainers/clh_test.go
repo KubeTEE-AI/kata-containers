@@ -69,6 +69,7 @@ func newClhConfig() (HypervisorConfig, error) {
 		NetRateLimiterOpsMaxRate:      int64(0),
 		NetRateLimiterOpsOneTimeBurst: int64(0),
 		HotPlugVFIO:                   config.NoPort,
+		DisableImageNvdimm:            true,
 	}, nil
 }
 
@@ -147,7 +148,7 @@ func TestCloudHypervisorAddNetCheckNetConfigListValues(t *testing.T) {
 
 	e := &VethEndpoint{}
 	e.NetPair.TAPIface.HardAddr = macTest
-	e.NetPair.TapInterface.VMFds = vmFds
+	e.NetPair.VMFds = vmFds
 
 	err = clh.addNet(e)
 	assert.Nil(err)
@@ -182,7 +183,7 @@ func TestCloudHypervisorAddNetCheckEnpointTypes(t *testing.T) {
 
 	validVeth := &VethEndpoint{}
 	validVeth.NetPair.TAPIface.HardAddr = macTest
-	validVeth.NetPair.TapInterface.VMFds = vmFds
+	validVeth.NetPair.VMFds = vmFds
 
 	type args struct {
 		e Endpoint
@@ -223,7 +224,7 @@ func TestCloudHypervisorNetRateLimiter(t *testing.T) {
 	vmFds = append(vmFds, file)
 
 	validVeth := &VethEndpoint{}
-	validVeth.NetPair.TapInterface.VMFds = vmFds
+	validVeth.NetPair.VMFds = vmFds
 
 	type args struct {
 		bwMaxRate       int64

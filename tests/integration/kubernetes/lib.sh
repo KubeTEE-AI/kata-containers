@@ -103,6 +103,43 @@ k8s_create_pod() {
 	fi
 }
 
+# Creates a debugger pod if one doesn't already exist.
+#
+# Parameters:
+#	$1 - the node name
+#
+create_debugger_pod() {
+	local node="$1"
+	local pod_name="custom-node-debugger-$(echo -n "$node" | sha1sum | cut -c1-7)"
+
+	# Check if there is an existing node debugger pod and reuse it
+	# Otherwise, create a new one
+	if ! kubectl get pod -n kube-system "${pod_name}" > /dev/null 2>&1; then
+		POD_NAME="${pod_name}" NODE_NAME="${node}" envsubst < runtimeclass_workloads/custom-node-debugger.yaml | \
+			kubectl apply -n kube-system -f - > /dev/null
+		# Wait for the newly created pod to be ready
+		kubectl wait pod -n kube-system --timeout="30s" --for=condition=ready "${pod_name}" > /dev/null
+	fi
+
+	echo "${pod_name}"
+}
+
+# Copies a file into the host filesystem.
+#
+# Parameters:
+#	$1 - source file path on the client
+#   $2 - node
+#   $3 - destination path on the node
+#
+copy_file_to_host() {
+	local source="$1"
+	local node="$2"
+	local destination="$3"
+
+	debugger_pod="$(create_debugger_pod "${node}")"
+	kubectl cp -n kube-system "${source}" "${debugger_pod}:/host/${destination}"
+}
+
 # Runs a command in the host filesystem.
 #
 # Parameters:
@@ -114,25 +151,9 @@ exec_host() {
 	if ! kubectl get node "${node}" > /dev/null 2>&1; then
 		die "A given node ${node} is not valid"
 	fi
-	# `kubectl debug` always returns 0, so we hack it to return the right exit code.
-	local command="${@:2}"
-	# Make 7 character hash from the node name
-	local pod_name="custom-node-debugger-$(echo -n "$node" | sha1sum | cut -c1-7)"
 
-	# Run a debug pod
-	# Check if there is an existing node debugger pod and reuse it
-	# Otherwise, create a new one
-	if ! kubectl get pod -n kube-system "${pod_name}" > /dev/null 2>&1; then
-		POD_NAME="${pod_name}" NODE_NAME="${node}" envsubst < runtimeclass_workloads/custom-node-debugger.yaml | \
-			kubectl apply -n kube-system -f - > /dev/null
-		# Wait for the newly created pod to be ready
-		kubectl wait pod -n kube-system --timeout="30s" --for=condition=ready "${pod_name}" > /dev/null
-		# Manually check the exit status of the previous command to handle errors explicitly
-		# since `set -e` is not enabled, allowing subsequent commands to run if needed.
-		if [ $? -ne 0 ]; then
-			return $?
-		fi
-	fi
+	local command="${@:2}"
+	local pod_name="$(create_debugger_pod "${node}")"
 
 	# Execute the command and capture the output
 	# We're trailing the `\r` here due to: https://github.com/kata-containers/kata-containers/issues/8051
@@ -179,7 +200,7 @@ assert_pod_fail() {
 	local container_config="$1"
 	local duration="${2:-120}"
 
-	echo "In assert_pod_fail: $container_config"
+	echo "In assert_pod_fail: ${container_config}"
 	echo "Attempt to create the container but it should fail"
 
 	retry_kubectl_apply "${container_config}"
@@ -192,19 +213,66 @@ assert_pod_fail() {
 	local sleep_time=5
 	while true; do
 		echo "Waiting for a container to fail"
-		sleep ${sleep_time}
+		sleep "${sleep_time}"
 		elapsed_time=$((elapsed_time+sleep_time))
-		if [[ $(kubectl get pod "${pod_name}" \
-			-o jsonpath='{.status.containerStatuses[0].state.waiting.reason}') = *BackOff* ]]; then
+		waiting_reason=$(kubectl get pod "${pod_name}" \
+			-o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+		terminated_reason=$(kubectl get pod "${pod_name}" \
+			-o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null || true)
+		# BackOff/CrashLoopBackOff = container repeatedly failed; RunContainerError = e.g. image pull in guest failed
+		if [[ "${waiting_reason}" == *BackOff* ]] || [[ "${waiting_reason}" == *RunContainerError* ]]; then
 			return 0
 		fi
-		if [ $elapsed_time -gt $duration ]; then
+		if [[ "${terminated_reason}" == "StartError" ]] || [[ "${terminated_reason}" == "Error" ]]; then
+			return 0
+		fi
+		if [[ "${elapsed_time}" -gt "${duration}" ]]; then
 			echo "The container does not get into a failing state" >&2
 			break
 		fi
 	done
 	return 1
 
+}
+
+# Create a pod then assert it remains in ContainerCreating.
+#
+# Parameters:
+#	$1 - the pod configuration file.
+# 	$2 - the duration to wait (seconds). Defaults to 60. (optional)
+#
+assert_pod_container_creating() {
+	local container_config="$1"
+	local duration="${2:-60}"
+
+	echo "In assert_pod_container_creating: ${container_config}"
+	echo "Attempt to create the container but it should stay in creating state"
+
+	retry_kubectl_apply "${container_config}"
+	if ! pod_name=$(kubectl get pods -o jsonpath='{.items..metadata.name}'); then
+		echo "Failed to create the pod"
+		return 1
+	fi
+
+	local elapsed_time=0
+	local sleep_time=5
+	while true; do
+		sleep "${sleep_time}"
+		elapsed_time=$((elapsed_time+sleep_time))
+		reason=$(kubectl get pod "${pod_name}" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+		phase=$(kubectl get pod "${pod_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+		if [[ "${phase}" != "Pending" ]]; then
+			echo "Expected pod to remain Pending, got phase: ${phase}" >&2
+			return 1
+		fi
+		if [[ -n "${reason}" && "${reason}" != "ContainerCreating" ]]; then
+			echo "Expected ContainerCreating, got: ${reason}" >&2
+			return 1
+		fi
+		if [[ "${elapsed_time}" -ge "${duration}" ]]; then
+			return 0
+		fi
+	done
 }
 
 # Check the pulled rootfs on host for given node and sandbox_id
@@ -381,4 +449,3 @@ get_node_kata_sandbox_id() {
 	done
 	echo $kata_sandbox_id
 }
-

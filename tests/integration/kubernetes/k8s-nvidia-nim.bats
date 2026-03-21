@@ -48,11 +48,26 @@ KBS_AUTH_CONFIG_JSON=$(
 )
 export KBS_AUTH_CONFIG_JSON
 
-# Base64 encoding for use as Kubernetes Secret in pod manifests
+# Base64 encoding for use as Kubernetes Secret in pod manifests (non-TEE)
 NGC_API_KEY_BASE64=$(
     echo -n "${NGC_API_KEY}" | base64 -w0
 )
 export NGC_API_KEY_BASE64
+
+# pre-created signed sealed secrets for TEE pods (from confidential_common.sh)
+NGC_API_KEY_SEALED_SECRET_INSTRUCT="${SEALED_SECRET_PRECREATED_NIM_INSTRUCT}"
+export NGC_API_KEY_SEALED_SECRET_INSTRUCT
+
+# Base64 encode the sealed secret for use in Kubernetes Secret data field
+# (genpolicy only supports the 'data' field which expects base64 values)
+NGC_API_KEY_SEALED_SECRET_INSTRUCT_BASE64=$(echo -n "${NGC_API_KEY_SEALED_SECRET_INSTRUCT}" | base64 -w0)
+export NGC_API_KEY_SEALED_SECRET_INSTRUCT_BASE64
+
+NGC_API_KEY_SEALED_SECRET_EMBEDQA="${SEALED_SECRET_PRECREATED_NIM_EMBEDQA}"
+export NGC_API_KEY_SEALED_SECRET_EMBEDQA
+
+NGC_API_KEY_SEALED_SECRET_EMBEDQA_BASE64=$(echo -n "${NGC_API_KEY_SEALED_SECRET_EMBEDQA}" | base64 -w0)
+export NGC_API_KEY_SEALED_SECRET_EMBEDQA_BASE64
 
 setup_langchain_flow() {
     # shellcheck disable=SC1091  # Sourcing virtual environment activation script
@@ -66,18 +81,56 @@ setup_langchain_flow() {
     [[ "$(pip show beautifulsoup4 2>/dev/null | awk '/^Version:/{print $2}')" = "4.13.4" ]] || pip install beautifulsoup4==4.13.4
 }
 
-setup_kbs_credentials() {
-    # Get KBS address and export it for pod template substitution
-    export CC_KBS_ADDR="$(kbs_k8s_svc_http_addr)"
+# Create initdata TOML file for genpolicy with CDH configuration.
+# This file is used by genpolicy via --initdata-path. Genpolicy will add the
+# generated policy.rego to it and set it as the cc_init_data annotation.
+# We must overwrite the default empty file AFTER create_tmp_policy_settings_dir()
+# copies it to the temp directory.
+create_nim_initdata_file() {
+    local output_file="$1"
+    local cc_kbs_address
+    cc_kbs_address=$(kbs_k8s_svc_http_addr)
 
-    kbs_set_gpu0_resource_policy
+    cat > "${output_file}" << EOF
+version = "0.1.0"
+algorithm = "sha256"
+
+[data]
+"aa.toml" = '''
+[token_configs]
+[token_configs.kbs]
+url = "${cc_kbs_address}"
+'''
+
+"cdh.toml" = '''
+[kbc]
+name = "cc_kbc"
+url = "${cc_kbs_address}"
+
+[image]
+authenticated_registry_credentials_uri = "kbs:///default/credentials/nvcr"
+'''
+EOF
+}
+
+setup_kbs_credentials() {
+    # Export KBS address for use in pod YAML templates (aa_kbc_params)
+    CC_KBS_ADDR=$(kbs_k8s_svc_http_addr)
+    export CC_KBS_ADDR
 
     # Set up Kubernetes secret for the containerd metadata pull
     kubectl delete secret ngc-secret-instruct --ignore-not-found
     kubectl create secret docker-registry ngc-secret-instruct --docker-server="nvcr.io" --docker-username="\$oauthtoken" --docker-password="${NGC_API_KEY}"
 
+    kbs_set_gpu0_resource_policy
+
     # KBS_AUTH_CONFIG_JSON is already base64 encoded
     kbs_set_resource_base64 "default" "credentials" "nvcr" "${KBS_AUTH_CONFIG_JSON}"
+
+    # Store the actual NGC_API_KEY in KBS for sealed secret unsealing.
+    # The sealed secrets in the pod YAML point to these KBS resource paths.
+    kbs_set_resource "default" "ngc-api-key" "instruct" "${NGC_API_KEY}"
+    kbs_set_resource "default" "ngc-api-key" "embedqa" "${NGC_API_KEY}"
 }
 
 create_inference_pod() {
@@ -122,10 +175,6 @@ setup_file() {
     export POD_EMBEDQA_YAML_IN="${pod_config_dir}/${POD_NAME_EMBEDQA}.yaml.in"
     export POD_EMBEDQA_YAML="${pod_config_dir}/${POD_NAME_EMBEDQA}.yaml"
 
-    if [ "${TEE}" = "true" ]; then
-        setup_kbs_credentials
-    fi
-
     dpkg -s jq >/dev/null 2>&1 || sudo apt -y install jq
 
     export PYENV_ROOT="${HOME}/.pyenv"
@@ -139,6 +188,16 @@ setup_file() {
 
     policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
     add_requests_to_policy_settings "${policy_settings_dir}" "ReadStreamRequest"
+
+    if [ "${TEE}" = "true" ]; then
+        setup_kbs_credentials
+        # provision signing public key to KBS so that CDH can verify pre-created, signed secret.
+        setup_sealed_secret_signing_public_key
+        # Overwrite the empty default-initdata.toml with our CDH configuration.
+        # This must happen AFTER create_tmp_policy_settings_dir() copies the empty
+        # file and BEFORE auto_generate_policy() runs.
+        create_nim_initdata_file "${policy_settings_dir}/default-initdata.toml"
+    fi
 
     create_inference_pod
 

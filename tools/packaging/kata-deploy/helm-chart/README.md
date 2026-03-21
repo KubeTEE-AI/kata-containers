@@ -114,6 +114,11 @@ $ helm upgrade kata-deploy -n kube-system \
 $ helm uninstall kata-deploy -n kube-system
 ```
 
+During uninstall, Helm will report that some resources were kept due to the
+resource policy (`ServiceAccount`, `ClusterRole`, `ClusterRoleBinding`). This
+is **normal**. A post-delete hook Job runs after uninstall and removes those
+resources so no cluster-wide `RBAC` is left behind.
+
 ## Configuration Reference
 
 All values can be overridden with --set key=value or a custom `-f myvalues.yaml`.
@@ -122,8 +127,10 @@ All values can be overridden with --set key=value or a custom `-f myvalues.yaml`
 |-----|-------------|---------|
 | `imagePullPolicy` | Set the DaemonSet pull policy | `Always` |
 | `imagePullSecrets` | Enable pulling from a private registry via pull secret | `""` |
-| `image.reference` | Fully qualified image reference | `quay.io/kata-containers/kata-deploy` |
-| `image.tag` | Tag of the image reference | `""` |
+| `image.reference` | Fully qualified image reference (for digest pinning use the full image e.g. `…@sha256:...`; tag is ignored) | `quay.io/kata-containers/kata-deploy` |
+| `image.tag` | Tag of the image reference (defaults to chart `AppVersion` when empty) | `""` |
+| `kubectlImage.reference` | Fully qualified `kubectl` image reference (for digest pinning use the full image e.g. `…@sha256:...` and leave `kubectlImage.tag` empty) | `quay.io/kata-containers/kubectl` |
+| `kubectlImage.tag` | Tag of the `kubectl` image reference | `latest` |
 | `k8sDistribution` | Set the k8s distribution to use: `k8s`, `k0s`, `k3s`, `rke2`, `microk8s` | `k8s` |
 | `nodeSelector` | Node labels for pod assignment. Allows restricting deployment to specific nodes | `{}` |
 | `runtimeClasses.enabled` | Enable Helm-managed `runtimeClass` creation (recommended) | `true` |
@@ -224,6 +231,7 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    # Optional: set runtimeClass.nodeSelector to pin TEE to specific nodes (always applied). If unset, NFD TEE labels are auto-injected when NFD is detected.
 
 # Default shim per architecture
 defaultShim:
@@ -306,8 +314,8 @@ helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-d
 Includes:
 - `qemu-snp` - AMD SEV-SNP (amd64)
 - `qemu-tdx` - Intel TDX (amd64)
-- `qemu-se` - IBM Secure Execution (s390x)
-- `qemu-se-runtime-rs` - IBM Secure Execution Rust runtime (s390x)
+- `qemu-se` - IBM Secure Execution for Linux (SEL) (s390x)
+- `qemu-se-runtime-rs` - IBM Secure Execution for Linux (SEL) Rust runtime (s390x)
 - `qemu-cca` - Arm Confidential Compute Architecture (arm64)
 - `qemu-coco-dev` - Confidential Containers development (amd64, s390x)
 - `qemu-coco-dev-runtime-rs` - Confidential Containers development Rust runtime (amd64, s390x)
@@ -328,6 +336,27 @@ Includes:
 - `qemu-nvidia-gpu-tdx` - NVIDIA GPU with Intel TDX (amd64)
 
 **Note**: These example files are located in the chart directory. When installing from the OCI registry, you'll need to download them separately or clone the repository to access them.
+
+### RuntimeClass Node Selectors for TEE Shims
+
+**Manual configuration:** Any `nodeSelector` you set under `shims.<shim>.runtimeClass.nodeSelector`
+is **always applied** to that shim's RuntimeClass, whether or not NFD is present. Use this when
+you want to pin TEE workloads to specific nodes (e.g. without NFD, or with custom labels).
+
+**Auto-inject when NFD is present:** If you do *not* set a `runtimeClass.nodeSelector` for a
+TEE shim, the chart can **automatically inject** NFD-based labels when NFD is detected in the
+cluster (deployed by this chart with `node-feature-discovery.enabled=true` or found externally):
+- AMD SEV-SNP shims: `amd.feature.node.kubernetes.io/snp: "true"`
+- Intel TDX shims: `intel.feature.node.kubernetes.io/tdx: "true"`
+- IBM Secure Execution for Linux (SEL) shims (s390x): `feature.node.kubernetes.io/cpu-security.se.enabled: "true"`
+
+The chart uses Helm's `lookup` function to detect NFD (by looking for the
+`node-feature-discovery-worker` DaemonSet). Auto-inject only runs when NFD is detected and
+no manual `runtimeClass.nodeSelector` is set for that shim.
+
+**Note**: NFD detection requires cluster access. During `helm template` (dry-run without a
+cluster), external NFD is not seen, so auto-injected labels are not added. Manual
+`runtimeClass.nodeSelector` values are still applied in all cases.
 
 ## `RuntimeClass` Management
 
@@ -448,3 +477,65 @@ kata-qemu-snp-cicd              kata-qemu-snp-cicd              77s
 kata-qemu-tdx-cicd              kata-qemu-tdx-cicd              77s
 kata-stratovirt-cicd            kata-stratovirt-cicd            77s
 ```
+
+## Customizing Configuration with Drop-in Files
+
+When kata-deploy installs Kata Containers, the base configuration files should not
+be modified directly. Instead, use drop-in configuration files to customize
+settings. This approach ensures your customizations survive kata-deploy upgrades.
+
+### How Drop-in Files Work
+
+The Kata runtime reads the base configuration file and then applies any `.toml`
+files found in the `config.d/` directory alongside it. Files are processed in
+alphabetical order, with later files overriding earlier settings.
+
+### Creating Custom Drop-in Files
+
+To add custom settings, create a `.toml` file in the appropriate `config.d/`
+directory. Use a numeric prefix to control the order of application.
+
+**Reserved prefixes** (used by kata-deploy):
+- `10-*`: Core kata-deploy settings
+- `20-*`: Debug settings
+- `30-*`: Kernel parameters
+
+**Recommended prefixes for custom settings**: `50-89`
+
+### Example: Adding Custom Kernel Parameters
+
+```bash
+# SSH into the node or use kubectl exec
+sudo mkdir -p /opt/kata/share/defaults/kata-containers/runtimes/qemu/config.d/
+sudo cat > /opt/kata/share/defaults/kata-containers/runtimes/qemu/config.d/50-custom.toml << 'EOF'
+[hypervisor.qemu]
+kernel_params = "my_param=value"
+EOF
+```
+
+### Example: Changing Default Memory Size
+
+```bash
+sudo cat > /opt/kata/share/defaults/kata-containers/runtimes/qemu/config.d/50-memory.toml << 'EOF'
+[hypervisor.qemu]
+default_memory = 4096
+EOF
+```
+
+### Custom Runtimes
+
+For more complex customizations, you can define custom runtimes in your Helm
+values. Custom runtimes create isolated configuration directories with their
+own drop-in files:
+
+```yaml
+customRuntimes:
+  enabled: true
+  runtimes:
+    - handler: kata-custom
+      baseConfig: qemu
+      dropInFile: /path/to/your/config.toml
+```
+
+This creates a new Runtime Class `kata-custom` that extends the `qemu`
+configuration with your custom settings.

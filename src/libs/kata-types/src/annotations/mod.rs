@@ -149,6 +149,9 @@ pub const KATA_ANNO_CFG_HYPERVISOR_KERNEL_HASH: &str =
 /// A sandbox annotation for passing additional guest kernel parameters.
 pub const KATA_ANNO_CFG_HYPERVISOR_KERNEL_PARAMS: &str =
     "io.katacontainers.config.hypervisor.kernel_params";
+/// A sandbox annotation for passing guest dm-verity parameters.
+pub const KATA_ANNO_CFG_HYPERVISOR_KERNEL_VERITY_PARAMS: &str =
+    "io.katacontainers.config.hypervisor.kernel_verity_params";
 /// A sandbox annotation for passing a container guest image path.
 pub const KATA_ANNO_CFG_HYPERVISOR_IMAGE_PATH: &str = "io.katacontainers.config.hypervisor.image";
 /// A sandbox annotation for passing a container guest image SHA-512 hash value.
@@ -315,6 +318,9 @@ pub const KATA_ANNO_CFG_EXPERIMENTAL: &str = "io.katacontainers.config.runtime.e
 /// interface.
 pub const KATA_ANNO_CFG_INTER_NETWORK_MODEL: &str =
     "io.katacontainers.config.runtime.internetworking_model";
+/// Network device specific annotation for network queues
+pub const KATA_ANNO_CFG_HYPERVISOR_NETWORK_QUEUES: &str =
+    "io.katacontainers.config.hypervisor.network_queues";
 /// SandboxCgroupOnly is a sandbox annotation that determines if kata processes are managed only in sandbox cgroup.
 pub const KATA_ANNO_CFG_SANDBOX_CGROUP_ONLY: &str =
     "io.katacontainers.config.runtime.sandbox_cgroup_only";
@@ -630,6 +636,9 @@ impl Annotation {
                     KATA_ANNO_CFG_HYPERVISOR_KERNEL_PARAMS => {
                         hv.boot_info.replace_kernel_params(value);
                     }
+                    KATA_ANNO_CFG_HYPERVISOR_KERNEL_VERITY_PARAMS => {
+                        hv.boot_info.replace_kernel_verity_params(value)?;
+                    }
                     KATA_ANNO_CFG_HYPERVISOR_IMAGE_PATH => {
                         hv.boot_info.validate_boot_path(value)?;
                         hv.boot_info.image = value.to_string();
@@ -899,6 +908,14 @@ impl Annotation {
                             }
                         }
                     }
+                    KATA_ANNO_CFG_HYPERVISOR_NETWORK_QUEUES => match self.get_value::<u32>(key) {
+                        Ok(r) => {
+                            hv.network_info.network_queues = r.unwrap_or_default();
+                        }
+                        Err(_e) => {
+                            return Err(u32_err);
+                        }
+                    },
                     // Hypervisor Security related annotations
                     KATA_ANNO_CFG_HYPERVISOR_GUEST_HOOK_PATH => {
                         hv.security_info.validate_path(value)?;

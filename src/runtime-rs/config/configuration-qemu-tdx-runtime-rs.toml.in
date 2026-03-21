@@ -39,7 +39,7 @@ vm_rootfs_driver = "virtio-blk-pci"
 #
 # Known limitations:
 # * Does not work by design:
-#   - CPU Hotplug 
+#   - CPU Hotplug
 #   - Memory Hotplug
 #   - NVDIMM devices
 #
@@ -74,9 +74,14 @@ valid_hypervisor_paths = @QEMUVALIDHYPERVISORPATHS@
 # container and look for 'default-kernel-parameters' log entries.
 kernel_params = "@KERNELTDXPARAMS@"
 
+# Optional dm-verity parameters (comma-separated key=value list):
+# root_hash=...,salt=...,data_blocks=...,data_block_size=...,hash_block_size=...
+# These are used by the runtime to assemble dm-verity kernel params.
+kernel_verity_params = "@KERNELVERITYPARAMS@"
+
 # Path to the firmware.
 # If you want that qemu uses the default firmware leave this option empty
-firmware = "@FIRMWARETDXPATH@"
+firmware = "@FIRMWARETDVFPATH@"
 
 # Path to the firmware volume.
 # firmware TDVF or OVMF can be split into FIRMWARE_VARS.fd (UEFI variables
@@ -371,7 +376,7 @@ disable_nesting_checks = false
 # Otherwise virtio-block device is used.
 #
 # nvdimm is not supported when `confidential_guest = true`.
-disable_image_nvdimm = @DEFDISABLEIMAGENVDIMM@
+disable_image_nvdimm = true
 
 # Before hot plugging a PCIe device, you need to add a pcie_root_port device.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
@@ -428,6 +433,14 @@ rx_rate_limiter_max_rate = 0
 # to discipline traffic.
 # Default 0-sized value means unlimited rate.
 tx_rate_limiter_max_rate = 0
+# network_queues configures the number of virtio-net queue pairs (RX/TX) exposed to the guest.
+# Setting network_queues = N creates N RX queues and N TX queues (i.e., N queue pairs).
+# More queues can improve network throughput and reduce per-queue contention by allowing packet processing to scale
+# across multiple vCPUs/threads (subject to host/guest capabilities and backend configuration such as vhost-net).
+# Increasing this value consumes more resources (e.g., virtqueue state, interrupts/MSI-X vectors, backend threads),
+# so it should typically not exceed the number of vCPUs or the practical parallelism of the networking backend.
+# Default: 1, Range: 1..=256
+network_queues = @DEFNETQUEUES@
 
 # Set where to save the guest memory dump file.
 # If set, when GUEST_PANICKED event occurred,

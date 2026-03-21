@@ -62,7 +62,7 @@ deploy_kata() {
 	local extra_values_file="${1:-}"
 	shift || true
 	local extra_helm_args=("$@")
-	
+
 	local chart_path
 	local values_yaml
 
@@ -115,7 +115,7 @@ deploy_kata() {
 	kubectl -n "${HELM_NAMESPACE}" rollout status daemonset/kata-deploy --timeout=300s
 
 	# Give it a moment to configure runtimes
-	sleep 10
+	sleep 60
 
 	return 0
 }
@@ -124,4 +124,6 @@ deploy_kata() {
 uninstall_kata() {
 	helm uninstall "${HELM_RELEASE_NAME}" -n "${HELM_NAMESPACE}" \
 		--ignore-not-found --wait --cascade foreground --timeout 10m || true
+
+	wait_for_api_and_retry_uninstall "${HELM_RELEASE_NAME}" "${HELM_NAMESPACE}"
 }

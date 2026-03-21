@@ -24,7 +24,7 @@ KBUILD_SIGN_PIN=${KBUILD_SIGN_PIN:-}
 AGENT_POLICY="${AGENT_POLICY:-no}"
 
 NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:?NVIDIA_GPU_STACK must be set}
-VARIANT=${VARIANT:?VARIANT must be set}
+BUILD_VARIANT=${BUILD_VARIANT:?BUILD_VARIANT must be set}
 ARCH=${ARCH:?ARCH must be set}
 
 machine_arch="${ARCH}"
@@ -37,7 +37,7 @@ else
     die "Unsupported architecture: ${machine_arch}"
 fi
 
-readonly stage_one="${BUILD_DIR:?}/rootfs-${VARIANT:?}-stage-one"
+readonly stage_one="${BUILD_DIR:?}/rootfs-${BUILD_VARIANT:?}-stage-one"
 
 setup_nvidia-nvrc() {
 	local url ver
@@ -84,7 +84,7 @@ setup_nvidia_gpu_rootfs_stage_one() {
 	fi
 	tar -xvf "${BUILD_DIR}/${nvrc}.tar.xz" -C ./bin/
 
-	local appendix="${rootfs_type:+"-${rootfs_type}"}"
+	local appendix=""
 	if echo "${NVIDIA_GPU_STACK}" | grep -q '\<dragonball\>'; then
     		appendix="-dragonball-experimental"
 	fi
@@ -97,7 +97,7 @@ setup_nvidia_gpu_rootfs_stage_one() {
 	mount --make-rslave ./dev
 	mount -t proc /proc ./proc
 
-	local cuda_repo_url cuda_repo_pkg gpu_base_os_version
+	local cuda_repo_url cuda_repo_pkg gpu_base_os_version ctk_version
 	cuda_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.cuda.repo.${machine_arch}.url")
 	cuda_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.cuda.repo.${machine_arch}.pkg")
 	gpu_base_os_version=$(get_package_version_from_kata_yaml "assets.image.architecture.x86_64.nvidia-gpu.version")
@@ -105,8 +105,10 @@ setup_nvidia_gpu_rootfs_stage_one() {
 	tools_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${machine_arch}.url")
 	tools_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${machine_arch}.pkg")
 
+	ctk_version=$(get_package_version_from_kata_yaml "externals.nvidia.ctk.version")
+
 	chroot . /bin/bash -c "/nvidia_chroot.sh ${machine_arch} ${NVIDIA_GPU_STACK} \
-		 ${gpu_base_os_version} ${cuda_repo_url} ${cuda_repo_pkg} ${tools_repo_url} ${tools_repo_pkg}"
+		 ${gpu_base_os_version} ${cuda_repo_url} ${cuda_repo_pkg} ${tools_repo_url} ${tools_repo_pkg} ${ctk_version}"
 
 	umount -R ./dev
 	umount ./proc
@@ -145,17 +147,21 @@ chisseled_nvswitch() {
 
 	mkdir -p usr/share/nvidia/nvswitch
 
-	cp -a "${stage_one}"/usr/bin/nv-fabricmanager 	bin/.
-	cp -a "${stage_one}"/usr/share/nvidia/nvswitch usr/share/nvidia/.
+	cp -a "${stage_one}"/usr/bin/nv-fabricmanager	bin/.
+	cp -a "${stage_one}"/usr/share/nvidia/nvswitch	usr/share/nvidia/.
 
 	libdir=usr/lib/"${machine_arch}"-linux-gnu
-
 	cp -a "${stage_one}/${libdir}"/libnvidia-nscq.so.* lib/"${machine_arch}"-linux-gnu/.
 
-	# Logs will be redirected to console(stderr)
-	# if the specified log file can't be opened or the path is empty.
-	# LOG_FILE_NAME=/var/log/fabricmanager.log -> setting to empty for stderr -> kmsg
-	sed -i 's|^LOG_FILE_NAME=.*|LOG_FILE_NAME=|' usr/share/nvidia/nvswitch/fabricmanager.cfg
+	# NVLINK SubnetManager dependencies
+	local nvlsm=usr/share/nvidia/nvlsm
+	mkdir -p "${nvlsm}"
+
+	cp -a "${stage_one}"/opt/nvidia/nvlsm/lib/libgrpc_mgr.so	lib/.
+	cp -a "${stage_one}"/opt/nvidia/nvlsm/sbin/nvlsm			sbin/.
+	cp -a "${stage_one}/${nvlsm}"/*.conf						"${nvlsm}"/.
+	# Redirect all the logs to syslog instead of logging to file
+	sed -i 's|^LOG_USE_SYSLOG=.*|LOG_USE_SYSLOG=1|' usr/share/nvidia/nvswitch/fabricmanager.cfg
 }
 
 chisseled_dcgm() {
@@ -201,9 +207,8 @@ chisseled_compute() {
 	cp -aL "${stage_one}/${libdir}"/ld-linux-* "${libdir}"/.
 
 	libdir=usr/lib/"${machine_arch}"-linux-gnu
-	cp -a "${stage_one}/${libdir}"/libnvidia-ml.so.*  lib/"${machine_arch}"-linux-gnu/.
+	cp -a "${stage_one}/${libdir}"/libnv*        lib/"${machine_arch}"-linux-gnu/.
 	cp -a "${stage_one}/${libdir}"/libcuda.so.*       lib/"${machine_arch}"-linux-gnu/.
-	cp -a "${stage_one}/${libdir}"/libnvidia-cfg.so.* lib/"${machine_arch}"-linux-gnu/.
 
 	# basic GPU admin tools
 	cp -a "${stage_one}"/usr/bin/nvidia-persistenced  bin/.
@@ -235,6 +240,8 @@ chisseled_init() {
 		 usr/bin etc/modprobe.d etc/ssl/certs
 
 	ln -sf ../run var/run
+	ln -sf ../run var/log
+	ln -sf ../run var/cache
 
 	# Needed for various RUST static builds with LIBC=gnu
 	libdir=lib/"${machine_arch}"-linux-gnu
@@ -301,6 +308,44 @@ compress_rootfs() {
 	chmod +x "${libdir}"/ld-linux-*
 }
 
+copy_cdh_runtime_deps() {
+	local libdir="lib/${machine_arch}-linux-gnu"
+
+	# Shared libraries required by /usr/local/bin/confidential-data-hub.
+	# Note: libcryptsetup loads some optional helpers (e.g. libpopt/libssh) only
+	# when specific features are used. The current CDH path (LUKS2 + mkfs.ext4)
+	# does not require those optional libs.
+	cp -a "${stage_one}/${libdir}"/libcryptsetup.so.12*    "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libuuid.so.1*           "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libdevmapper.so.1.02.1* "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libselinux.so.1*        "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libpcre2-8.so.0*        "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libudev.so.1*           "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libcap.so.2*            "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libcrypto.so.3*         "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libz.so.1*              "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libzstd.so.1*           "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libjson-c.so.5*         "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libblkid.so.1*          "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libargon2.so.1*         "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libgcc_s.so.1*          "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libm.so.6*              "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libc.so.6*              "${libdir}/."
+
+	# e2fsprogs (mkfs.ext4) runtime libs
+	cp -a "${stage_one}/${libdir}"/libext2fs.so.2*         "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libe2p.so.2*            "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libss.so.2*             "${libdir}/."
+	cp -a "${stage_one}/${libdir}"/libcom_err.so.2*        "${libdir}/."
+
+	# mkfs.ext4 and dd are used by CDH secure_mount
+	mkdir -p sbin etc usr/bin bin
+	cp -a "${stage_one}/sbin/mke2fs" sbin/.
+	cp -a "${stage_one}/sbin/mkfs.ext4" sbin/.
+	cp -a "${stage_one}/etc/mke2fs.conf" etc/.
+	cp -a "${stage_one}/usr/bin/dd" bin/.
+}
+
 coco_guest_components() {
 	if [[ "${type}" != "confidential" ]]; then
 		return
@@ -323,7 +368,7 @@ coco_guest_components() {
 	cp -a "${stage_one}/${pause_dir}"/config.json  "${pause_dir}/."
 	cp -a "${stage_one}/${pause_dir}"/rootfs/pause "${pause_dir}/rootfs/."
 
-	info "TODO: nvidia: luks-encrypt-storage is a bash script, we do not have a shell!"
+	copy_cdh_runtime_deps
 }
 
 setup_nvidia_gpu_rootfs_stage_two() {

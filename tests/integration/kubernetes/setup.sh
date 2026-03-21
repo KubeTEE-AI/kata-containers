@@ -14,6 +14,7 @@ export AUTO_GENERATE_POLICY="${AUTO_GENERATE_POLICY:-no}"
 export KATA_HOST_OS="${KATA_HOST_OS:-}"
 export KATA_HYPERVISOR="${KATA_HYPERVISOR:-}"
 export PULL_TYPE="${PULL_TYPE:-default}"
+export RUNS_ON_AKS="${RUNS_ON_AKS:-false}"
 
 declare -r kubernetes_dir=$(dirname "$(readlink -f "$0")")
 declare -r runtimeclass_workloads_work_dir="${kubernetes_dir}/runtimeclass_workloads_work"
@@ -99,23 +100,31 @@ add_annotations_to_yaml() {
 	esac
 }
 
+add_cbl_mariner_annotation_to_yaml() {
+	local -r yaml_file="$1"
+
+	local -r mariner_annotation_kernel="io.katacontainers.config.hypervisor.kernel"
+	local -r mariner_kernel_path="/usr/share/cloud-hypervisor/vmlinux.bin"
+
+	local -r mariner_annotation_image="io.katacontainers.config.hypervisor.image"
+	local -r mariner_image_path="/opt/kata/share/kata-containers/kata-containers-mariner.img"
+
+	add_annotations_to_yaml "${yaml_file}" "${mariner_annotation_kernel}" "${mariner_kernel_path}"
+	add_annotations_to_yaml "${yaml_file}" "${mariner_annotation_image}" "${mariner_image_path}"
+}
+
 add_cbl_mariner_specific_annotations() {
 	if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
-		info "Add kernel and image path and annotations for cbl-mariner"
-		local mariner_annotation_kernel="io.katacontainers.config.hypervisor.kernel"
-		local mariner_kernel_path="/usr/share/cloud-hypervisor/vmlinux.bin"
-
-		local mariner_annotation_image="io.katacontainers.config.hypervisor.image"
-		local mariner_image_path="/opt/kata/share/kata-containers/kata-containers-mariner.img"
-
-		local mariner_annotation_disable_image_nvdimm="io.katacontainers.config.hypervisor.disable_image_nvdimm"
-		local mariner_disable_image_nvdimm=true
+		info "Adding annotations for cbl-mariner"
 
 		for K8S_TEST_YAML in runtimeclass_workloads_work/*.yaml
 		do
-			add_annotations_to_yaml "${K8S_TEST_YAML}" "${mariner_annotation_kernel}" "${mariner_kernel_path}"
-			add_annotations_to_yaml "${K8S_TEST_YAML}" "${mariner_annotation_image}" "${mariner_image_path}"
-			add_annotations_to_yaml "${K8S_TEST_YAML}" "${mariner_annotation_disable_image_nvdimm}" "${mariner_disable_image_nvdimm}"
+			add_cbl_mariner_annotation_to_yaml "${K8S_TEST_YAML}"
+		done
+
+		for K8S_TEST_YAML in runtimeclass_workloads_work/openvpn/*.yaml
+		do
+			add_cbl_mariner_annotation_to_yaml "${K8S_TEST_YAML}"
 		done
 	fi
 }

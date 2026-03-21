@@ -23,23 +23,21 @@ pushd ${KATA_DEPLOY_DIR}
 
 arch=$(uname -m)
 [ "$arch" = "x86_64" ] && arch="amd64"
+# Disable provenance and SBOM so each tag is a single image manifest. quay.io rejects
+# pushing multi-arch manifest lists that include attestation manifests ("manifest invalid").
+PLATFORM="linux/${arch}"
 IMAGE_TAG="${REGISTRY}:kata-containers-$(git rev-parse HEAD)-${arch}"
 
 echo "Building the image"
-docker build --tag ${IMAGE_TAG} .
-
-echo "Pushing the image to the registry"
-docker push ${IMAGE_TAG}
+docker buildx build --platform "${PLATFORM}" --provenance false --sbom false \
+	--tag "${IMAGE_TAG}" --push .
 
 if [ -n "${TAG}" ]; then
 	ADDITIONAL_TAG="${REGISTRY}:${TAG}"
 
 	echo "Building the ${ADDITIONAL_TAG} image"
-
-	docker build --tag ${ADDITIONAL_TAG} .
-
-	echo "Pushing the image ${ADDITIONAL_TAG} to the registry"
-	docker push ${ADDITIONAL_TAG}
+	docker buildx build --platform "${PLATFORM}" --provenance false --sbom false \
+		--tag "${ADDITIONAL_TAG}" --push .
 fi
 
 popd

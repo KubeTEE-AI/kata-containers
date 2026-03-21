@@ -6,14 +6,16 @@
 
 use anyhow::{anyhow, Context, Result};
 use common::{
-    message::Message,
+    message::{Action, Message},
     types::{
-        ContainerProcess, PlatformInfo, SandboxConfig, SandboxRequest, SandboxResponse,
-        SandboxStatusInfo, StartSandboxInfo, TaskRequest, TaskResponse, DEFAULT_SHM_SIZE,
+        ContainerProcess, PlatformInfo, ProcessType, SandboxConfig, SandboxRequest,
+        SandboxResponse, SandboxStatusInfo, StartSandboxInfo, TaskRequest, TaskResponse,
+        DEFAULT_SHM_SIZE,
     },
     RuntimeHandler, RuntimeInstance, Sandbox, SandboxNetworkEnv,
 };
 
+use containerd_shim_protos::events::task::{TaskCreate, TaskDelete, TaskStart};
 use hypervisor::{
     utils::{create_dir_all_with_inherit_owner, create_vmm_user, remove_vmm_user},
     Param,
@@ -33,6 +35,7 @@ use netns_rs::{Env, NetNs};
 use nix::{sys::statfs, unistd::User};
 use oci_spec::runtime as oci;
 use persist::sandbox_persist::Persist;
+use protobuf::Message as ProtobufMessage;
 use resource::{
     cpu_mem::initial_size::InitialSizeManager,
     network::{dan_config_path, generate_netns_name},
@@ -45,7 +48,7 @@ use std::{
     ops::Deref,
     os::unix::fs::{chown, MetadataExt},
     path::{Path, PathBuf},
-    str::{from_utf8, FromStr},
+    str::FromStr,
     sync::Arc,
     time::SystemTime,
 };
@@ -479,6 +482,7 @@ impl RuntimeHandlerManager {
                 .await
                 .context("start sandbox in task handler")?;
 
+            let bundle = container_config.bundle.clone();
             let container_id = container_config.container_id.clone();
             let shim_pid = instance
                 .container_manager
@@ -499,6 +503,19 @@ impl RuntimeHandlerManager {
                     error!(sl!(), "sandbox wait process error: {:?}", e);
                 }
             });
+
+            let msg_sender = self.inner.read().await.msg_sender.clone();
+            let event = TaskCreate {
+                container_id,
+                bundle,
+                pid,
+                ..Default::default()
+            };
+            let msg = Message::new(Action::Event(Arc::new(event)));
+            msg_sender
+                .send(msg)
+                .await
+                .context("send task create event")?;
 
             Ok(TaskResponse::CreateContainer(shim_pid))
         } else {
@@ -569,6 +586,7 @@ impl RuntimeHandlerManager {
             .context("get runtime instance")?;
         let sandbox = instance.sandbox.clone();
         let cm = instance.container_manager.clone();
+        let msg_sender = self.inner.read().await.msg_sender.clone();
 
         match req {
             TaskRequest::CreateContainer(req) => Err(anyhow!("Unreachable TaskRequest {:?}", req)),
@@ -578,6 +596,20 @@ impl RuntimeHandlerManager {
             }
             TaskRequest::DeleteProcess(process_id) => {
                 let resp = cm.delete_process(&process_id).await.context("do delete")?;
+                if process_id.process_type == ProcessType::Container {
+                    let event = TaskDelete {
+                        id: process_id.container_id().to_string(),
+                        pid: resp.pid.pid,
+                        exit_status: resp.exit_status as u32,
+                        ..Default::default()
+                    };
+                    let msg = Message::new(Action::Event(Arc::new(event)));
+                    msg_sender
+                        .send(msg)
+                        .await
+                        .context("send task delete event")?;
+                }
+
                 Ok(TaskResponse::DeleteProcess(resp))
             }
             TaskRequest::ExecProcess(req) => {
@@ -613,12 +645,28 @@ impl RuntimeHandlerManager {
                     .context("start process")?;
 
                 let pid = shim_pid.pid;
+                let process_type = process_id.process_type;
+                let container_id = process_id.container_id().to_string();
                 tokio::spawn(async move {
                     let result = sandbox.wait_process(cm, process_id, pid).await;
                     if let Err(e) = result {
                         error!(sl!(), "sandbox wait process error: {:?}", e);
                     }
                 });
+
+                if process_type == ProcessType::Container {
+                    let event = TaskStart {
+                        container_id,
+                        pid,
+                        ..Default::default()
+                    };
+                    let msg = Message::new(Action::Event(Arc::new(event)));
+                    msg_sender
+                        .send(msg)
+                        .await
+                        .context("send task start event")?;
+                }
+
                 Ok(TaskResponse::StartProcess(shim_pid))
             }
 
@@ -700,11 +748,21 @@ fn load_config(an: &HashMap<String, String>, option: &Option<Vec<u8>>) -> Result
     } else if let Ok(path) = std::env::var(KATA_CONF_FILE) {
         path
     } else if let Some(option) = option {
-        // get rid of the special characters in options to get the config path
-        if option.len() > 2 {
-            from_utf8(&option[2..])?.to_string()
-        } else {
-            String::from("")
+        // Parse the containerd runtime options protobuf message to extract the config path.
+        // The options are passed as a serialized runtimeoptions.v1.Options protobuf message
+        // from containerd's configuration (e.g., [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]).
+        match <protocols::runtimeoptions::Options as ProtobufMessage>::parse_from_bytes(option) {
+            Ok(opts) => opts.config_path,
+            Err(e) => {
+                // Log the error but don't fail - fall back to default config paths
+                let logger = slog::Logger::clone(&slog_scope::logger());
+                slog::warn!(
+                    logger,
+                    "failed to parse containerd runtime options: {}, falling back to default config paths",
+                    e
+                );
+                String::from("")
+            }
         }
     } else {
         String::from("")

@@ -10,7 +10,8 @@ OS_VERSION=${OS_VERSION:-""}
 [ -z "$OS_VERSION" ] && echo "OS_VERSION is required, but was not set" && exit 1
 PACKAGES="chrony iptables dbus"
 [ "$AGENT_INIT" = no ] && PACKAGES+=" init"
-[ "$MEASURED_ROOTFS" = yes ] && PACKAGES+=" cryptsetup-bin e2fsprogs"
+# CDH secure storage feature requires these tools in the guest
+[[ "${CONFIDENTIAL_GUEST:-no}" = "yes" ]] && PACKAGES+=" cryptsetup-bin e2fsprogs"
 [ "$SECCOMP" = yes ] && PACKAGES+=" libseccomp2"
 [ "$(uname -m)" = "s390x" ] && PACKAGES+=" libcurl4 libnghttp2-14"
 REPO_COMPONENTS=${REPO_COMPONENTS:-main}

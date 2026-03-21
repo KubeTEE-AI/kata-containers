@@ -22,9 +22,9 @@ import (
 	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/pbnjay/memory"
 	"github.com/sirupsen/logrus"
@@ -93,6 +93,7 @@ type hypervisor struct {
 	MachineAccelerators            string                    `toml:"machine_accelerators"`
 	CPUFeatures                    string                    `toml:"cpu_features"`
 	KernelParams                   string                    `toml:"kernel_params"`
+	KernelVerityParams             string                    `toml:"kernel_verity_params"`
 	MachineType                    string                    `toml:"machine_type"`
 	QgsPort                        uint32                    `toml:"tdx_quote_generation_service_socket_port"`
 	BlockDeviceDriver              string                    `toml:"block_device_driver"`
@@ -154,6 +155,8 @@ type hypervisor struct {
 	VirtioMem                      bool                      `toml:"enable_virtio_mem"`
 	IOMMU                          bool                      `toml:"enable_iommu"`
 	IOMMUPlatform                  bool                      `toml:"enable_iommu_platform"`
+	NUMA                           bool                      `toml:"enable_numa"`
+	NUMAMapping                    []string                  `toml:"numa_mapping"`
 	Debug                          bool                      `toml:"enable_debug"`
 	DisableNestingChecks           bool                      `toml:"disable_nesting_checks"`
 	EnableIOThreads                bool                      `toml:"enable_iothreads"`
@@ -194,10 +197,28 @@ type runtime struct {
 	StaticSandboxResourceMgmt bool     `toml:"static_sandbox_resource_mgmt"`
 	EnablePprof               bool     `toml:"enable_pprof"`
 	DisableGuestEmptyDir      bool     `toml:"disable_guest_empty_dir"`
+	EmptyDirMode              string   `toml:"emptydir_mode"`
 	CreateContainerTimeout    uint64   `toml:"create_container_timeout"`
 	DanConf                   string   `toml:"dan_conf"`
 	ForceGuestPull            bool     `toml:"experimental_force_guest_pull"`
 	PodResourceAPISock        string   `toml:"pod_resource_api_sock"`
+	KubeletRootDir            string   `toml:"kubelet_root_dir"`
+}
+
+// emptyDirMode returns a valid emptydir_mode value, defaulting to shared-fs
+// if the TOML field is unset.
+func (r runtime) emptyDirMode() (string, error) {
+	if r.EmptyDirMode == "" {
+		return vc.EmptyDirModeSharedFs, nil
+	}
+
+	switch r.EmptyDirMode {
+	case vc.EmptyDirModeSharedFs, vc.EmptyDirModeVirtioBlkEncrypted:
+		return r.EmptyDirMode, nil
+	default:
+		return "", fmt.Errorf("invalid emptydir_mode=%q, allowed values: %q, %q",
+			r.EmptyDirMode, vc.EmptyDirModeSharedFs, vc.EmptyDirModeVirtioBlkEncrypted)
+	}
 }
 
 type agent struct {
@@ -385,6 +406,10 @@ func (h hypervisor) kernelParams() string {
 	}
 
 	return h.KernelParams
+}
+
+func (h hypervisor) kernelVerityParams() string {
+	return h.KernelVerityParams
 }
 
 func (h hypervisor) machineType() string {
@@ -719,6 +744,18 @@ func (h hypervisor) getIOMMUPlatform() bool {
 	return h.IOMMUPlatform
 }
 
+func (h hypervisor) defaultGuestNUMANodes() []types.GuestNUMANode {
+	if !h.NUMA {
+		return nil
+	}
+	numaNodes, err := utils.GetGuestNUMANodes(h.NUMAMapping)
+	if err != nil {
+		kataUtilsLogger.WithError(err).Warn("Cannot construct guest NUMA nodes.")
+		return nil
+	}
+	return numaNodes
+}
+
 func (h hypervisor) getRemoteHypervisorSocket() string {
 	if h.RemoteHypervisorSocket == "" {
 		return defaultRemoteHypervisorSocket
@@ -814,6 +851,7 @@ func newFirecrackerHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		RootfsType:            rootfsType,
 		FirmwarePath:          firmware,
 		KernelParams:          vc.DeserializeParams(vc.KernelParamFields(kernelParams)),
+		KernelVerityParams:    h.kernelVerityParams(),
 		NumVCPUsF:             h.defaultVCPUs(),
 		DefaultMaxVCPUs:       h.defaultMaxVCPUs(),
 		MemorySize:            h.defaultMemSz(),
@@ -948,6 +986,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		MachineAccelerators:      machineAccelerators,
 		CPUFeatures:              cpuFeatures,
 		KernelParams:             vc.DeserializeParams(vc.KernelParamFields(kernelParams)),
+		KernelVerityParams:       h.kernelVerityParams(),
 		HypervisorMachineType:    machineType,
 		QgsPort:                  h.qgsPort(),
 		NumVCPUsF:                h.defaultVCPUs(),
@@ -974,6 +1013,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		HugePages:                h.HugePages,
 		IOMMU:                    h.IOMMU,
 		IOMMUPlatform:            h.getIOMMUPlatform(),
+		GuestNUMANodes:           h.defaultGuestNUMANodes(),
 		FileBackedMemRootDir:     h.FileBackedMemRootDir,
 		FileBackedMemRootList:    h.FileBackedMemRootList,
 		Debug:                    h.Debug,
@@ -1088,6 +1128,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		FirmwarePath:                   firmware,
 		MachineAccelerators:            machineAccelerators,
 		KernelParams:                   vc.DeserializeParams(vc.KernelParamFields(kernelParams)),
+		KernelVerityParams:             h.kernelVerityParams(),
 		HypervisorMachineType:          machineType,
 		NumVCPUsF:                      h.defaultVCPUs(),
 		DefaultMaxVCPUs:                h.defaultMaxVCPUs(),
@@ -1165,16 +1206,17 @@ func newDragonballHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 	kernelParams := h.kernelParams()
 
 	return vc.HypervisorConfig{
-		KernelPath:      kernel,
-		ImagePath:       image,
-		RootfsType:      rootfsType,
-		KernelParams:    vc.DeserializeParams(vc.KernelParamFields(kernelParams)),
-		NumVCPUsF:       h.defaultVCPUs(),
-		DefaultMaxVCPUs: h.defaultMaxVCPUs(),
-		MemorySize:      h.defaultMemSz(),
-		MemSlots:        h.defaultMemSlots(),
-		EntropySource:   h.GetEntropySource(),
-		Debug:           h.Debug,
+		KernelPath:         kernel,
+		ImagePath:          image,
+		RootfsType:         rootfsType,
+		KernelParams:       vc.DeserializeParams(vc.KernelParamFields(kernelParams)),
+		KernelVerityParams: h.kernelVerityParams(),
+		NumVCPUsF:          h.defaultVCPUs(),
+		DefaultMaxVCPUs:    h.defaultMaxVCPUs(),
+		MemorySize:         h.defaultMemSz(),
+		MemSlots:           h.defaultMemSlots(),
+		EntropySource:      h.GetEntropySource(),
+		Debug:              h.Debug,
 	}, nil
 }
 
@@ -1249,6 +1291,7 @@ func newStratovirtHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		ImagePath:             image,
 		RootfsType:            rootfsType,
 		KernelParams:          vc.DeserializeParams(strings.Fields(kernelParams)),
+		KernelVerityParams:    h.kernelVerityParams(),
 		HypervisorMachineType: machineType,
 		NumVCPUsF:             h.defaultVCPUs(),
 		DefaultMaxVCPUs:       h.defaultMaxVCPUs(),
@@ -1364,6 +1407,16 @@ func updateRuntimeConfigAgent(configPath string, tomlConf tomlConfig, config *oc
 	return nil
 }
 
+func updateRuntimeConfigRuntime(configPath string, tomlConf tomlConfig, config *oci.RuntimeConfig) error {
+	emptyDirMode, err := tomlConf.Runtime.emptyDirMode()
+	if err != nil {
+		return fmt.Errorf("%v: %v", configPath, err)
+	}
+	config.EmptyDirMode = emptyDirMode
+
+	return nil
+}
+
 // SetKernelParams adds the user-specified kernel parameters (from the
 // configuration file) to the defaults so that the former take priority.
 func SetKernelParams(runtimeConfig *oci.RuntimeConfig) error {
@@ -1425,6 +1478,10 @@ func updateRuntimeConfig(configPath string, tomlConf tomlConfig, config *oci.Run
 	}
 
 	if err := updateRuntimeConfigAgent(configPath, tomlConf, config); err != nil {
+		return err
+	}
+
+	if err := updateRuntimeConfigRuntime(configPath, tomlConf, config); err != nil {
 		return err
 	}
 
@@ -1617,6 +1674,7 @@ func LoadConfiguration(configPath string, ignoreLogging bool) (resolvedConfigPat
 
 	config.ForceGuestPull = tomlConf.Runtime.ForceGuestPull
 	config.PodResourceAPISock = tomlConf.Runtime.PodResourceAPISock
+	config.KubeletRootDir = tomlConf.Runtime.KubeletRootDir
 
 	return resolved, config, nil
 }
@@ -1874,8 +1932,8 @@ func checkConfig(config oci.RuntimeConfig) error {
 // checkPCIeConfig ensures the PCIe configuration is valid.
 // Only allow one of the following settings for cold-plug:
 // no-port, root-port, switch-port
-func checkPCIeConfig(coldPlug config.PCIePort, hotPlug config.PCIePort, machineType string, hypervisorType virtcontainers.HypervisorType) error {
-	if hypervisorType != virtcontainers.QemuHypervisor && hypervisorType != virtcontainers.ClhHypervisor {
+func checkPCIeConfig(coldPlug config.PCIePort, hotPlug config.PCIePort, machineType string, hypervisorType vc.HypervisorType) error {
+	if hypervisorType != vc.QemuHypervisor && hypervisorType != vc.ClhHypervisor {
 		kataUtilsLogger.Warn("Advanced PCIe Topology only available for QEMU/CLH hypervisor, ignoring hot(cold)_vfio_port setting")
 		return nil
 	}
@@ -1891,7 +1949,7 @@ func checkPCIeConfig(coldPlug config.PCIePort, hotPlug config.PCIePort, machineT
 	if machineType != "q35" && machineType != "virt" {
 		return nil
 	}
-	if hypervisorType == virtcontainers.ClhHypervisor {
+	if hypervisorType == vc.ClhHypervisor {
 		if coldPlug != config.NoPort {
 			return fmt.Errorf("cold-plug not supported on CLH")
 		}

@@ -24,6 +24,7 @@ cuda_repo_url="${4:?cuda_repo_url not specified}"
 cuda_repo_pkg="${5:?cuda_repo_pkg not specified}"
 tools_repo_url="${6:?tools_repo_url not specified}"
 tools_repo_pkg="${7:?tools_repo_pkg not specified}"
+ctk_version="${8:?ctk_version not specified}"
 APT_INSTALL="apt -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -yqq --no-install-recommends install"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -36,7 +37,7 @@ is_feature_enabled() {
 install_nvidia_ctk() {
 	echo "chroot: Installing NVIDIA GPU container runtime"
 	# Base  gives a nvidia-ctk and the nvidia-container-runtime
-	eval "${APT_INSTALL}" nvidia-container-toolkit-base=1.17.6-1
+	eval "${APT_INSTALL}" nvidia-container-toolkit-base="${ctk_version}"
 }
 
 install_nvidia_fabricmanager() {
@@ -45,8 +46,8 @@ install_nvidia_fabricmanager() {
 		return
 	}
 	echo "chroot: Install NVIDIA fabricmanager"
-	eval "${APT_INSTALL}" nvidia-fabricmanager libnvidia-nscq
-	apt-mark hold nvidia-fabricmanager libnvidia-nscq
+	eval "${APT_INSTALL}" nvidia-fabricmanager libnvidia-nscq nvlsm
+	apt-mark hold nvidia-fabricmanager libnvidia-nscq nvlsm
 }
 
 install_userspace_components() {
@@ -60,12 +61,19 @@ install_userspace_components() {
 	eval "${APT_INSTALL}" nvidia-imex nvidia-firmware    \
 		libnvidia-cfg1 libnvidia-gl libnvidia-extra      \
 		libnvidia-decode libnvidia-fbc1 libnvidia-encode \
-		libnvidia-nscq
+		libnvidia-nscq libnvidia-compute nvidia-settings
 
 	apt-mark hold nvidia-imex nvidia-firmware            \
 		libnvidia-cfg1 libnvidia-gl libnvidia-extra      \
 		libnvidia-decode libnvidia-fbc1 libnvidia-encode \
-		libnvidia-nscq
+		libnvidia-nscq libnvidia-compute nvidia-settings
+
+	# Needed for confidential-data-hub runtime dependencies
+	eval "${APT_INSTALL}" cryptsetup-bin dmsetup         \
+		libargon2-1 e2fsprogs
+
+	apt-mark hold cryptsetup-bin dmsetup libargon2-1     \
+		e2fsprogs
 }
 
 setup_apt_repositories() {
@@ -147,6 +155,18 @@ install_nvidia_dcgm() {
 		datacenter-gpu-manager-exporter
 }
 
+install_devkit_packages() {
+	is_feature_enabled "devkit" || {
+		echo "chroot: Skipping devkit packages installation"
+		return
+	}
+
+	echo "chroot: Install devkit packages"
+
+	eval "${APT_INSTALL}" kmod
+	apt-mark hold kmod
+}
+
 cleanup_rootfs() {
 	echo "chroot: Cleanup NVIDIA GPU rootfs"
 
@@ -174,4 +194,5 @@ install_userspace_components
 install_nvidia_fabricmanager
 install_nvidia_ctk
 install_nvidia_dcgm
+install_devkit_packages
 cleanup_rootfs

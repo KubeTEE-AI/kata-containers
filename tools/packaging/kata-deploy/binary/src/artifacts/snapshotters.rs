@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::runtime::containerd;
 use crate::utils;
 use crate::utils::toml as toml_utils;
 use anyhow::Result;
@@ -87,16 +88,13 @@ pub async fn configure_snapshotter(
 ) -> Result<()> {
     // Get all paths and drop-in capability in one call
     let paths = config.get_containerd_paths(runtime).await?;
-    
-    // Read containerd version from config_file to determine pluginid
-    let pluginid = if fs::read_to_string(&paths.config_file)
-        .unwrap_or_default()
-        .contains("version = 3")
-    {
-        "\"io.containerd.cri.v1.images\""
-    } else {
-        "\"io.containerd.grpc.v1.cri\".containerd"
+
+    // Runtime plugin id (from paths or by reading config), then map to table where disable_snapshot_annotations lives.
+    let runtime_plugin_id = match &paths.plugin_id {
+        Some(id) => id.as_str(),
+        None => containerd::get_containerd_pluginid(&paths.config_file)?,
     };
+    let pluginid = containerd::pluginid_for_snapshotter_annotations(runtime_plugin_id, &paths.config_file)?;
 
     let configuration_file: std::path::PathBuf = if paths.use_drop_in {
         // Only add /host prefix if path is not in /etc/containerd (which is mounted from host)
@@ -151,10 +149,10 @@ pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
     // When containerd tries to use non-existent snapshots, it will re-pull/re-unpack.
     let nydus_data_dir = format!("/host/var/lib/{nydus_snapshotter}");
     info!("Cleaning up existing nydus-snapshotter state at {}", nydus_data_dir);
-    
+
     // Stop the service first if it exists (ignore errors if not running)
     let _ = utils::host_systemctl(&["stop", &format!("{nydus_snapshotter}.service")]);
-    
+
     // Remove the data directory to clean up old snapshots with potentially incorrect labels
     if Path::new(&nydus_data_dir).exists() {
         info!("Removing nydus data directory: {}", nydus_data_dir);
@@ -209,19 +207,37 @@ pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
 
     fs::create_dir_all(format!("{}/nydus-snapshotter", config.host_install_dir))?;
 
+    // Remove existing binaries before copying new ones.
+    // This is crucial for atomic updates (same pattern as copy_artifacts in install.rs):
+    // - If the file is in use (e.g., a running binary), the old inode stays alive
+    // - The new copy creates a new inode
+    // - Running processes keep using the old inode until they exit
+    // - New processes use the new file immediately
+    // Without this, fs::copy would fail with ETXTBSY ("Text file busy") if the
+    // nydus-snapshotter service is still running from a previous installation.
+    let grpc_binary = format!(
+        "{}/nydus-snapshotter/containerd-nydus-grpc",
+        config.host_install_dir
+    );
+    let overlayfs_binary = format!(
+        "{}/nydus-snapshotter/nydus-overlayfs",
+        config.host_install_dir
+    );
+    for binary in [&grpc_binary, &overlayfs_binary] {
+        match fs::remove_file(binary) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     fs::copy(
         "/opt/kata-artifacts/nydus-snapshotter/containerd-nydus-grpc",
-        format!(
-            "{}/nydus-snapshotter/containerd-nydus-grpc",
-            config.host_install_dir
-        ),
+        &grpc_binary,
     )?;
     fs::copy(
         "/opt/kata-artifacts/nydus-snapshotter/nydus-overlayfs",
-        format!(
-            "{}/nydus-snapshotter/nydus-overlayfs",
-            config.host_install_dir
-        ),
+        &overlayfs_binary,
     )?;
 
     fs::write(

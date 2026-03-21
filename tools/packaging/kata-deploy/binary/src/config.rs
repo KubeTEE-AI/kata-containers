@@ -6,6 +6,92 @@
 use anyhow::{Context, Result};
 use log::info;
 use std::env;
+use std::fs;
+use std::path::Path;
+
+use crate::k8s;
+
+/// K3s/RKE2 containerd config template filenames (under the mounted containerd dir).
+/// V3 is for containerd 2.x; V2 is for containerd 1.x.
+pub const K3S_RKE2_CONTAINERD_V3_TMPL: &str = "/etc/containerd/config-v3.toml.tmpl";
+pub const K3S_RKE2_CONTAINERD_V2_TMPL: &str = "/etc/containerd/config.toml.tmpl";
+
+/// Resolves whether to use containerd config v3 (true) or v2 (false) for K3s/RKE2.
+/// 1. Tries config.toml (containerd config file): if it exists and contains "version = 3" or "version = 2", use that.
+/// 2. Else falls back to the node's containerRuntimeVersion (e.g. "containerd://2.1.5-k3s1").
+/// 3. If neither is available, returns an error.
+pub fn k3s_rke2_resolve_use_v3(
+    config_file_path: &str,
+    container_runtime_version: Option<&str>,
+) -> Result<bool> {
+    use crate::runtime::manager;
+
+    // 1. Try config.toml (generated config that may already exist on the node)
+    if let Ok(content) = fs::read_to_string(config_file_path) {
+        if content.contains("version = 3") {
+            return Ok(true);
+        }
+        if content.contains("version = 2") {
+            return Ok(false);
+        }
+    }
+
+    // 2. Fall back to node's container runtime version
+    if let Some(version) = container_runtime_version {
+        return Ok(manager::containerd_version_is_2_or_newer(version));
+    }
+
+    // 3. Neither source available
+    Err(anyhow::anyhow!(
+        "K3s/RKE2: cannot determine containerd config version (v2 vs v3). \
+         Need version from {config_file_path} (version = 2/3) or node containerRuntimeVersion."
+    ))
+}
+
+/// Returns the K3s/RKE2 containerd template path. Use v3 for containerd 2.x, v2 for 1.x.
+pub fn k3s_rke2_containerd_template_path(use_v3: bool) -> &'static str {
+    if use_v3 {
+        K3S_RKE2_CONTAINERD_V3_TMPL
+    } else {
+        K3S_RKE2_CONTAINERD_V2_TMPL
+    }
+}
+
+/// Returns the containerd CRI plugin ID for K3s/RKE2 (section key we write under).
+/// Config v3 uses "io.containerd.cri.v1.runtime", v2 uses "io.containerd.grpc.v1.cri".
+pub fn k3s_rke2_containerd_plugin_id(use_v3: bool) -> &'static str {
+    if use_v3 {
+        "\"io.containerd.cri.v1.runtime\""
+    } else {
+        "\"io.containerd.grpc.v1.cri\""
+    }
+}
+
+/// K3s/RKE2: drop-in directory name in the rendered config (config.toml.d or config-v3.toml.d).
+pub fn k3s_rke2_drop_in_dir_name(use_v3: bool) -> &'static str {
+    if use_v3 {
+        "config-v3.toml.d"
+    } else {
+        "config.toml.d"
+    }
+}
+
+/// Path to the rendered containerd config.
+/// K3s/RKE2 always render to config.toml regardless of which template
+/// (config.toml.tmpl or config-v3.toml.tmpl) they use.
+pub fn k3s_rke2_rendered_config_path() -> &'static str {
+    "/etc/containerd/config.toml"
+}
+
+/// Returns true if the rendered config content imports the correct drop-in dir.
+/// We only use k3s/rke2 drop-in when the distro has already configured this import.
+pub fn k3s_rke2_rendered_has_import(content: &str, use_v3: bool) -> bool {
+    content.contains(k3s_rke2_drop_in_dir_name(use_v3))
+}
+
+/// Default Kata Containers installation directory.
+/// This is where Kata artifacts are installed by default.
+pub const DEFAULT_KATA_INSTALL_DIR: &str = "/opt/kata";
 
 /// Containerd configuration paths and capabilities for a specific runtime
 #[derive(Debug, Clone)]
@@ -21,6 +107,8 @@ pub struct ContainerdPaths {
     pub drop_in_file: String,
     /// Whether drop-in files can be used (based on containerd version)
     pub use_drop_in: bool,
+    /// For K3s/RKE2: CRI plugin ID to use (derived from containerd version). Others: None (read from file).
+    pub plugin_id: Option<String>,
 }
 
 /// Custom runtime configuration parsed from ConfigMap
@@ -109,7 +197,6 @@ impl Config {
         let pull_type_mapping_for_arch = get_arch_var_or_base("PULL_TYPE_MAPPING", &arch);
 
         let installation_prefix = env::var("INSTALLATION_PREFIX").ok().filter(|s| !s.is_empty());
-        let default_dest_dir = "/opt/kata";
         let dest_dir = match installation_prefix {
             Some(ref prefix) => {
                 if !prefix.starts_with('/') {
@@ -117,9 +204,9 @@ impl Config {
                         r#"INSTALLATION_PREFIX must begin with a "/" (ex. /hoge/fuga)"#
                     ));
                 }
-                format!("{prefix}{default_dest_dir}")
+                format!("{prefix}{DEFAULT_KATA_INSTALL_DIR}")
             }
-            None => default_dest_dir.to_string(),
+            None => DEFAULT_KATA_INSTALL_DIR.to_string(),
         };
 
         let multi_install_suffix = env::var("MULTI_INSTALL_SUFFIX").ok().and_then(|s| {
@@ -429,10 +516,10 @@ impl Config {
     /// Get containerd configuration file paths based on runtime type and containerd version
     pub async fn get_containerd_paths(&self, runtime: &str) -> Result<ContainerdPaths> {
         use crate::runtime::manager;
-        
+
         // Check if drop-in files can be used based on containerd version
         let use_drop_in = manager::is_containerd_capable_of_using_drop_in_files(self, runtime).await?;
-        
+
         let paths = match runtime {
             "k0s-worker" | "k0s-controller" => ContainerdPaths {
                 config_file: "/etc/containerd/containerd.toml".to_string(),
@@ -440,6 +527,7 @@ impl Config {
                 imports_file: None, // k0s auto-loads from containerd.d/, imports not needed
                 drop_in_file: "/etc/containerd/containerd.d/kata-deploy.toml".to_string(),
                 use_drop_in,
+                plugin_id: None,
             },
             "microk8s" => ContainerdPaths {
                 // microk8s uses containerd-template.toml instead of config.toml
@@ -448,25 +536,70 @@ impl Config {
                 imports_file: Some("/etc/containerd/containerd-template.toml".to_string()),
                 drop_in_file: self.containerd_drop_in_conf_file.clone(),
                 use_drop_in,
+                plugin_id: None,
             },
-            "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server" => ContainerdPaths {
-                // k3s/rke2 generates config.toml from config.toml.tmpl on each restart
-                // We must modify the template file so our changes persist
-                config_file: "/etc/containerd/config.toml.tmpl".to_string(),
-                backup_file: "/etc/containerd/config.toml.tmpl.bak".to_string(),
-                imports_file: Some("/etc/containerd/config.toml.tmpl".to_string()),
-                drop_in_file: self.containerd_drop_in_conf_file.clone(),
-                use_drop_in,
-            },
+            "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server" => {
+                // K3s/RKE2: we only use drop-in when the rendered config already imports the
+                // versioned drop-in dir (config.toml.d or config-v3.toml.d). If the import is
+                // missing we bail; the cluster must configure the template with the import
+                // (e.g. in tests or via a custom k3s/RKE2 setup). Refs: docs.k3s.io/advanced#configuring-containerd
+                let container_runtime_version = k8s::get_node_field(
+                    self,
+                    ".status.nodeInfo.containerRuntimeVersion",
+                )
+                .await
+                .ok();
+                let use_v3 = k3s_rke2_resolve_use_v3(
+                    &self.containerd_conf_file,
+                    container_runtime_version.as_deref(),
+                )?;
+                let config_file = k3s_rke2_containerd_template_path(use_v3).to_string();
+                let rendered_path = k3s_rke2_rendered_config_path().to_string();
+                let content = fs::read_to_string(&rendered_path).with_context(|| {
+                    format!(
+                        "K3s/RKE2: cannot read rendered config at {rendered_path}. \
+                         Ensure the containerd config dir is mounted and k3s/RKE2 has rendered the config."
+                    )
+                })?;
+                if !k3s_rke2_rendered_has_import(&content, use_v3) {
+                    anyhow::bail!(
+                        "K3s/RKE2: rendered config at {} does not import the drop-in dir '{}'. \
+                         kata-deploy requires the containerd template to include that import. \
+                         Add e.g. imports = [\".../{}/*.toml\"] to the template and restart k3s/RKE2.",
+                        rendered_path,
+                        k3s_rke2_drop_in_dir_name(use_v3),
+                        k3s_rke2_drop_in_dir_name(use_v3),
+                    );
+                }
+                let template_dir = Path::new(&config_file)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "/etc/containerd".to_string());
+                let drop_in_file = format!(
+                    "{}/{}/kata-deploy.toml",
+                    template_dir,
+                    k3s_rke2_drop_in_dir_name(use_v3),
+                );
+                let backup_file = format!("{config_file}.bak");
+                ContainerdPaths {
+                    config_file: config_file.clone(),
+                    backup_file,
+                    imports_file: None, // we do not modify the template; import is already there
+                    drop_in_file,
+                    use_drop_in: true,
+                    plugin_id: Some(k3s_rke2_containerd_plugin_id(use_v3).to_string()),
+                }
+            }
             _ => ContainerdPaths {
                 config_file: self.containerd_conf_file.clone(),
                 backup_file: self.containerd_conf_file_backup.clone(),
                 imports_file: Some(self.containerd_conf_file.clone()),
                 drop_in_file: self.containerd_drop_in_conf_file.clone(),
                 use_drop_in,
+                plugin_id: None,
             },
         };
-        
+
         Ok(paths)
     }
 }
@@ -616,9 +749,9 @@ mod tests {
     //! will cause race conditions and test failures.
     //!
     //! Use: cargo test --bin kata-deploy -- --test-threads=1
-    //! Or:  cargo test-serial (if the cargo alias is configured)
 
     use super::*;
+    use rstest::rstest;
 
     // NOTE: These tests modify environment variables which are process-global.
     // Run with: cargo test config::tests -- --test-threads=1
@@ -675,7 +808,7 @@ mod tests {
         cleanup_env_vars();
         std::env::set_var("NODE_NAME", "test-node");
         std::env::set_var("DEBUG", "false");
-        
+
         // Set arch-specific variables based on current architecture
         let arch = get_arch().unwrap();
         let arch_suffix = match arch.as_str() {
@@ -685,13 +818,13 @@ mod tests {
             "ppc64le" => "_PPC64LE",
             _ => "",
         };
-        
+
         if !arch_suffix.is_empty() {
             std::env::set_var(format!("SHIMS{}", arch_suffix), "qemu");
             std::env::set_var(format!("DEFAULT_SHIM{}", arch_suffix), "qemu");
         }
     }
-    
+
     /// Helper to set an arch-specific environment variable for testing
     fn set_arch_var(base_name: &str, value: &str) {
         let arch = get_arch().unwrap();
@@ -702,7 +835,7 @@ mod tests {
             "ppc64le" => "_PPC64LE",
             _ => "",
         };
-        
+
         if !arch_suffix.is_empty() {
             std::env::set_var(format!("{}{}", base_name, arch_suffix), value);
         }
@@ -734,6 +867,37 @@ mod tests {
         let result = get_arch_var("SHIMS", "default", "x86_64");
         assert_eq!(result, "test1 test2");
         cleanup_env_vars();
+    }
+
+    // --- k3s/rke2 helpers (no env vars) ---
+
+    #[rstest]
+    #[case(false, "config.toml.d")]
+    #[case(true, "config-v3.toml.d")]
+    fn test_k3s_rke2_drop_in_dir_name(#[case] use_v3: bool, #[case] expected: &str) {
+        assert_eq!(k3s_rke2_drop_in_dir_name(use_v3), expected);
+    }
+
+    #[test]
+    fn test_k3s_rke2_rendered_config_path() {
+        assert_eq!(k3s_rke2_rendered_config_path(), "/etc/containerd/config.toml");
+    }
+
+    #[rstest]
+    #[case(
+        "imports = [\"/var/lib/rancher/k3s/agent/etc/containerd/config.toml.d/*.toml\"]\n",
+        false,
+        true,
+    )]
+    #[case("version = 2\n", false, false)]
+    #[case("imports = [\"/path/config-v3.toml.d/*.toml\"]", true, true)]
+    #[case("imports = [\"/path/config.toml.d/*.toml\"]", true, false)]
+    fn test_k3s_rke2_rendered_has_import(
+        #[case] content: &str,
+        #[case] use_v3: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(k3s_rke2_rendered_has_import(content, use_v3), expected);
     }
 
     #[test]

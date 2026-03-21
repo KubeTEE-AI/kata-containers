@@ -26,7 +26,6 @@
 use super::{default, ConfigOps, ConfigPlugin, TomlConfig};
 use crate::annotations::KATA_ANNO_CFG_HYPERVISOR_PREFIX;
 use crate::{resolve_path, sl, validate_path};
-use byte_unit::{Byte, Unit};
 use lazy_static::lazy_static;
 use regex::RegexSet;
 use serde_enum_str::{Deserialize_enum_str, Serialize_enum_str};
@@ -34,7 +33,6 @@ use std::collections::HashMap;
 use std::io::{self, Result};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 mod dragonball;
 pub use self::dragonball::{DragonballConfig, HYPERVISOR_NAME_DRAGONBALL};
@@ -74,8 +72,137 @@ const VIRTIO_9P: &str = "virtio-9p";
 const VIRTIO_FS: &str = "virtio-fs";
 const VIRTIO_FS_INLINE: &str = "inline-virtio-fs";
 const MAX_BRIDGE_SIZE: u32 = 5;
+const MAX_NETWORK_QUEUES: u32 = 256;
 
 const KERNEL_PARAM_DELIMITER: &str = " ";
+/// Block size (in bytes) used by dm-verity block size validation.
+pub const VERITY_BLOCK_SIZE_BYTES: u64 = 512;
+/// Parsed kernel dm-verity parameters.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KernelVerityParams {
+    /// Root hash value.
+    pub root_hash: String,
+    /// Salt used to generate verity hash tree.
+    pub salt: String,
+    /// Number of data blocks in the verity mapping.
+    pub data_blocks: u64,
+    /// Data block size in bytes.
+    pub data_block_size: u64,
+    /// Hash block size in bytes.
+    pub hash_block_size: u64,
+}
+
+/// Parse and validate kernel dm-verity parameters.
+pub fn parse_kernel_verity_params(params: &str) -> Result<Option<KernelVerityParams>> {
+    if params.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut values = HashMap::new();
+    for field in params.split(',') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let mut parts = field.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let value = parts.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid kernel_verity_params entry: {field}"),
+            )
+        })?;
+        if key.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid kernel_verity_params entry: {field}"),
+            ));
+        }
+        values.insert(key.to_string(), value.to_string());
+    }
+
+    let root_hash = values
+        .get("root_hash")
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Missing kernel_verity_params root_hash",
+            )
+        })?
+        .to_string();
+
+    let salt = values.get("salt").cloned().unwrap_or_default();
+
+    let parse_uint_field = |name: &str| -> Result<u64> {
+        match values.get(name) {
+            Some(value) if !value.is_empty() => value.parse::<u64>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid kernel_verity_params {} '{}': {}", name, value, e),
+                )
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Missing kernel_verity_params {name}"),
+            )),
+        }
+    };
+
+    let data_blocks = parse_uint_field("data_blocks")?;
+    let data_block_size = parse_uint_field("data_block_size")?;
+    let hash_block_size = parse_uint_field("hash_block_size")?;
+
+    if salt.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Missing kernel_verity_params salt",
+        ));
+    }
+    if data_blocks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid kernel_verity_params data_blocks: must be non-zero",
+        ));
+    }
+    if data_block_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid kernel_verity_params data_block_size: must be non-zero",
+        ));
+    }
+    if hash_block_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid kernel_verity_params hash_block_size: must be non-zero",
+        ));
+    }
+    if data_block_size % VERITY_BLOCK_SIZE_BYTES != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid kernel_verity_params data_block_size: must be multiple of {}",
+                VERITY_BLOCK_SIZE_BYTES
+            ),
+        ));
+    }
+    if hash_block_size % VERITY_BLOCK_SIZE_BYTES != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid kernel_verity_params hash_block_size: must be multiple of {}",
+                VERITY_BLOCK_SIZE_BYTES
+            ),
+        ));
+    }
+
+    Ok(Some(KernelVerityParams {
+        root_hash,
+        salt,
+        data_blocks,
+        data_block_size,
+        hash_block_size,
+    }))
+}
 
 lazy_static! {
     static ref HYPERVISOR_PLUGINS: Mutex<HashMap<String, Arc<dyn ConfigPlugin>>> =
@@ -294,6 +421,10 @@ pub struct BootInfo {
     #[serde(default)]
     pub kernel_params: String,
 
+    /// Guest kernel dm-verity parameters.
+    #[serde(default)]
+    pub kernel_verity_params: String,
+
     /// Path to initrd file on host.
     #[serde(default)]
     pub initrd: String,
@@ -439,6 +570,17 @@ impl BootInfo {
         all_params.extend(new_param_list);
 
         self.kernel_params = all_params.join(KERNEL_PARAM_DELIMITER);
+    }
+
+    /// Replace kernel dm-verity parameters after validation.
+    pub fn replace_kernel_verity_params(&mut self, new_params: &str) -> Result<()> {
+        if new_params.trim().is_empty() {
+            return Ok(());
+        }
+
+        parse_kernel_verity_params(new_params)?;
+        self.kernel_verity_params = new_params.to_string();
+        Ok(())
     }
 
     /// Validate guest kernel image annotation.
@@ -863,6 +1005,57 @@ fn default_guest_swap_create_threshold_secs() -> u64 {
     60
 }
 
+/// Get host memory size in MiB.
+/// Retrieves the total physical memory of the host across different platforms.
+fn host_memory_mib() -> io::Result<u64> {
+    // Select a platform-specific implementation via a function pointer.
+    let get_memory: fn() -> io::Result<u64> = {
+        #[cfg(target_os = "linux")]
+        {
+            || {
+                let info = nix::sys::sysinfo::sysinfo().map_err(io::Error::other)?;
+                Ok(info.ram_total() / (1024 * 1024)) // MiB
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            || {
+                use sysctl::{Ctl, CtlValue, Sysctl};
+
+                let v = Ctl::new("hw.memsize")
+                    .map_err(io::Error::other)?
+                    .value()
+                    .map_err(io::Error::other)?;
+
+                let bytes = match v {
+                    CtlValue::S64(x) if x >= 0 => x as u64,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected sysctl hw.memsize value type: {:?}", other),
+                        ));
+                    }
+                };
+
+                Ok(bytes / (1024 * 1024)) // MiB
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "host memory query not implemented on this platform",
+                ))
+            }
+        }
+    };
+
+    get_memory()
+}
+
 impl MemoryInfo {
     /// Adjusts the configuration information after loading from a configuration file.
     ///
@@ -874,13 +1067,15 @@ impl MemoryInfo {
             self.file_mem_backend,
             "Memory backend file {} is invalid: {}"
         )?;
-        if self.default_maxmemory == 0 {
-            let s = System::new_with_specifics(
-                RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-            );
-            self.default_maxmemory = Byte::from_u64(s.total_memory())
-                .get_adjusted_unit(Unit::MiB)
-                .get_value() as u32;
+
+        let host_memory = host_memory_mib()?;
+
+        if u64::from(self.default_memory) > host_memory {
+            self.default_memory = host_memory as u32;
+        }
+
+        if self.default_maxmemory == 0 || u64::from(self.default_maxmemory) > host_memory {
+            self.default_maxmemory = host_memory as u32;
         }
         Ok(())
     }
@@ -949,6 +1144,13 @@ impl NetworkInfo {
     /// Adjusts the network configuration information after loading from a configuration file.
     /// (Currently, this method performs no adjustments.)
     pub fn adjust_config(&mut self) -> Result<()> {
+        if self.network_queues == 0 {
+            self.network_queues = 1;
+        }
+        if self.network_queues > MAX_NETWORK_QUEUES {
+            self.network_queues = MAX_NETWORK_QUEUES;
+        }
+
         Ok(())
     }
 
@@ -1016,6 +1218,29 @@ pub struct SecurityInfo {
     #[serde(default)]
     pub sev_snp_guest: bool,
 
+    /// SNP 'ID Block' and 'ID Authentication Information Structure'.
+    /// If one of snp_id_block or snp_id_auth is specified, the other must be specified, too.
+    /// Notice that the default SNP policy of QEMU (0x30000) is used by Kata, if not explicitly
+    /// set via 'snp_guest_policy' option. The IDBlock contains the guest policy as field, and
+    /// it must match the value from 'snp_guest_policy' or, if unset, the QEMU default policy.
+    /// 96-byte, base64-encoded blob to provide the 'ID Block' structure for the
+    /// SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (QEMU default: all-zero)
+    #[serde(default)]
+    pub snp_id_block: String,
+
+    /// 4096-byte, base64-encoded blob to provide the 'ID Authentication Information Structure'
+    /// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (QEMU default: all-zero)
+    #[serde(default)]
+    pub snp_id_auth: String,
+
+    /// SNP Guest Policy, the 'POLICY' parameter to the SNP_LAUNCH_START command.
+    /// If unset, the QEMU default policy (0x30000) will be used.
+    /// Notice that the guest policy is enforced at VM launch, and your pod VMs
+    /// won't start at all if the policy denys it. This will be indicated by a
+    /// 'SNP_LAUNCH_START' error.
+    #[serde(default = "default_snp_guest_policy")]
+    pub snp_guest_policy: u32,
+
     /// Path to OCI hook binaries in the *guest rootfs*.
     ///
     /// This setting does not affect host-side hooks, which must instead be
@@ -1075,6 +1300,10 @@ pub struct SecurityInfo {
 
 fn default_qgs_port() -> u32 {
     4050
+}
+
+fn default_snp_guest_policy() -> u32 {
+    0x30000
 }
 
 impl SecurityInfo {

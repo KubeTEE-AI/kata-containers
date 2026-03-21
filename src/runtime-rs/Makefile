@@ -15,6 +15,11 @@ PROJECT_URL = https://github.com/kata-containers
 PROJECT_COMPONENT = containerd-shim-kata-v2
 CONTAINERD_RUNTIME_NAME = io.containerd.kata.v2
 
+# This snippet finds all packages inside runtime-rs. Used for tessting.
+PACKAGES := $(shell cargo metadata --no-deps --format-version 1 | \
+                    jq -r '.packages[] | select(.manifest_path | contains("runtime-rs")) | .name')
+PACKAGE_FLAGS := $(patsubst %,-p %,$(PACKAGES))
+
 include ../../utils.mk
 
 ARCH_DIR = arch
@@ -45,9 +50,9 @@ test:
 else
 ##TARGET default: build code
 default: runtime show-header
-##TARGET test: run cargo tests
+##TARGET test: run cargo tests for runtime-rs and all its sub-crates.
 test: static-checks-build
-	@cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture  --skip bindgen
+	@cargo test $(PACKAGE_FLAGS) --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture  --skip bindgen
 install: install-runtime install-configs
 endif
 
@@ -148,12 +153,11 @@ ifneq (,$(QEMUCMD))
     endif
 endif
 
-ROOTMEASURECONFIG ?= ""
-KERNELTDXPARAMS += $(ROOTMEASURECONFIG)
+KERNELVERITYPARAMS ?= ""
 
 # TDX
 DEFSHAREDFS_QEMU_TDX_VIRTIOFS := none
-FIRMWARETDXPATH := $(PREFIXDEPS)/share/ovmf/OVMF.inteltdx.fd
+FIRMWARETDVFPATH := $(PREFIXDEPS)/share/ovmf/OVMF.inteltdx.fd
 
 # SEV-SNP
 FIRMWARE_SNP_PATH := $(PREFIXDEPS)/share/ovmf/AMDSEV.fd
@@ -176,8 +180,10 @@ DEFMEMSLOTS := 10
 DEFMAXMEMSZ := 0
 ##VAR DEFBRIDGES=<number> Default number of bridges
 DEFBRIDGES := 1
-DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"default_vcpus\", \"default_memory\"]
-DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
+##VAR DEFNETQUEUES=<number> Default number of network queues
+DEFNETQUEUES := 1
+DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\"]
+DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 DEFDISABLEGUESTEMPTYDIR := false
 ##VAR DEFAULTEXPFEATURES=[features] Default experimental features enabled
@@ -297,7 +303,7 @@ ifneq (,$(CLHCMD))
     KERNELTYPE_CLH = uncompressed
     KERNEL_NAME_CLH = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_CLH))
     KERNELPATH_CLH = $(KERNELDIR)/$(KERNEL_NAME_CLH)
-    VMROOTFSDRIVER_CLH := virtio-pmem
+    VMROOTFSDRIVER_CLH := virtio-blk-pci
 
     DEFSANDBOXCGROUPONLY_CLH := true
     DEFSTATICRESOURCEMGMT_CLH := false
@@ -378,7 +384,7 @@ ifneq (,$(QEMUCMD))
     KERNELPATH_QEMU_SE = $(KERNELDIR)/$(KERNEL_NAME_QEMU_SE)
 
     KERNEL_TYPE_COCO = compressed
-    KERNEL_NAME_COCO = $(call MAKE_KERNEL_NAME_COCO,$(KERNEL_TYPE_COCO))
+    KERNEL_NAME_COCO = $(call MAKE_KERNEL_NAME,$(KERNEL_TYPE_COCO))
     KERNELPATH_COCO = $(KERNELDIR)/$(KERNEL_NAME_COCO)
 
     # overriding options
@@ -527,6 +533,7 @@ USER_VARS += MACHINEACCELERATORS
 USER_VARS += CPUFEATURES
 USER_VARS += DEFMACHINETYPE_CLH
 USER_VARS += KERNELPARAMS
+USER_VARS += KERNELVERITYPARAMS
 USER_VARS += KERNELPARAMS_DB
 USER_VARS += KERNELPARAMS_FC
 USER_VARS += LIBEXECDIR
@@ -553,6 +560,7 @@ USER_VARS += DEFMEMSZ
 USER_VARS += DEFMEMSLOTS
 USER_VARS += DEFMAXMEMSZ
 USER_VARS += DEFBRIDGES
+USER_VARS += DEFNETQUEUES
 USER_VARS += DEFNETWORKMODEL_DB
 USER_VARS += DEFNETWORKMODEL_CLH
 USER_VARS += DEFNETWORKMODEL_QEMU
@@ -627,7 +635,7 @@ USER_VARS += FIRMWARE_SNP_PATH
 USER_VARS += FIRMWARE_VOLUME_SNP_PATH
 USER_VARS += KERNELTDXPARAMS
 USER_VARS += DEFSHAREDFS_QEMU_TDX_VIRTIOFS
-USER_VARS += FIRMWARETDXPATH
+USER_VARS += FIRMWARETDVFPATH
 USER_VARS += DEFPODRESOURCEAPISOCK
 
 SOURCES := \
@@ -719,10 +727,6 @@ define MAKE_KERNEL_NAME
 $(if $(findstring uncompressed,$1),vmlinux.container,vmlinuz.container)
 endef
 
-define MAKE_KERNEL_NAME_COCO
-$(if $(findstring uncompressed,$1),vmlinux-confidential.container,vmlinuz-confidential.container)
-endef
-
 .DEFAULT_GOAL := default
 
 GENERATED_FILES += $(CONFIGS)
@@ -734,7 +738,7 @@ static-checks-build: $(GENERATED_FILES)
 $(TARGET): $(GENERATED_FILES) $(TARGET_PATH)
 
 $(TARGET_PATH): $(SOURCES) | show-summary
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build -p runtime-rs --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
 $(GENERATED_FILES): %: %.in
 	@sed \
@@ -770,7 +774,7 @@ endif
 
 ##TARGET run: build and run agent
 run:
-	@cargo run --target $(TRIPLE)
+	@cargo run -p runtime-rs --target $(TRIPLE)
 
 show-header:
 	@printf "%s - version %s (commit %s)\n\n" "$(TARGET)" "$(VERSION)" "$(COMMIT_MSG)"

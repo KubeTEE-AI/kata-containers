@@ -35,8 +35,6 @@ on:
 jobs:
   run-cri-containerd:
     name: run-cri-containerd-${{ inputs.arch }} (${{ inputs.containerd_version }}, ${{ inputs.vmm }})
-    strategy:
-      fail-fast: false
     runs-on: ${{ inputs.runner }}
     env:
       CONTAINERD_VERSION: ${{ inputs.containerd_version }}
@@ -54,6 +52,25 @@ jobs:
           ./tests/git-helper.sh "rebase-atop-of-the-latest-target-branch"
         env:
           TARGET_BRANCH: ${{ inputs.target-branch }}
+
+      - name: Install yq
+        run: |
+          ./ci/install_yq.sh
+        env:
+          INSTALL_IN_GOPATH: false
+
+      - name: Read properties from versions.yaml
+        run: |
+          go_version="$(yq '.languages.golang.version' versions.yaml)"
+          [ -n "$go_version" ]
+          echo "GO_VERSION=${go_version}" >> "$GITHUB_ENV"
+
+      - name: Setup Golang version ${{ env.GO_VERSION }}
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Setup-go doesn't work properly with ppc64le: https://github.com/actions/setup-go/issues/648
+          architecture: ${{ inputs.arch == 'ppc64le' && 'ppc64le' || '' }}
 
       - name: Install dependencies
         timeout-minutes: 15

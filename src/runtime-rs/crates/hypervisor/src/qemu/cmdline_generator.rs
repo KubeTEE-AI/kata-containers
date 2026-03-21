@@ -179,16 +179,20 @@ impl Kernel {
         let mut kernel_params = KernelParams::new(config.debug_info.enable_debug);
 
         if config.boot_info.initrd.is_empty() {
-            // QemuConfig::validate() has already made sure that if initrd is
-            // empty, image cannot be so we don't need to re-check that here
+            // DAX is disabled on ARM due to a kernel panic in caches_clean_inval_pou.
+            #[cfg(target_arch = "aarch64")]
+            let use_dax = false;
+            #[cfg(not(target_arch = "aarch64"))]
+            let use_dax = true;
 
-            kernel_params.append(
-                &mut KernelParams::new_rootfs_kernel_params(
-                    &config.boot_info.vm_rootfs_driver,
-                    &config.boot_info.rootfs_type,
-                )
-                .context("adding rootfs params failed")?,
-            );
+            let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+                &config.boot_info.kernel_verity_params,
+                &config.boot_info.vm_rootfs_driver,
+                &config.boot_info.rootfs_type,
+                use_dax,
+            )
+            .context("adding rootfs/verity params failed")?;
+            kernel_params.append(&mut rootfs_params);
         }
 
         kernel_params.append(&mut KernelParams::from_string(
@@ -252,29 +256,8 @@ struct Memory {
 
 impl Memory {
     fn new(config: &HypervisorConfig) -> Memory {
-        // Move this to QemuConfig::adjust_config()?
-
-        let mut mem_size = config.memory_info.default_memory as u64;
-        let mut max_mem_size = config.memory_info.default_maxmemory as u64;
-
-        if let Ok(sysinfo) = nix::sys::sysinfo::sysinfo() {
-            let host_memory = sysinfo.ram_total() >> 20;
-
-            if mem_size > host_memory {
-                info!(sl!(), "'default_memory' given in configuration.toml is greater than host memory, adjusting to host memory");
-                mem_size = host_memory
-            }
-
-            if max_mem_size == 0 || max_mem_size > host_memory {
-                max_mem_size = host_memory
-            }
-        } else {
-            warn!(sl!(), "Failed to get host memory size, cannot verify or adjust configuration.toml's 'default_maxmemory'");
-
-            if max_mem_size == 0 {
-                max_mem_size = mem_size;
-            };
-        }
+        let mem_size = config.memory_info.default_memory as u64;
+        let max_mem_size = config.memory_info.default_maxmemory as u64;
 
         // Memory sizes are given in megabytes in configuration.toml so we
         // need to convert them to bytes for storage.
@@ -294,6 +277,18 @@ impl Memory {
             }
         }
         self.memory_backend_file = Some(mem_file.clone());
+        self
+    }
+
+    #[allow(dead_code)]
+    fn set_maxmem_size(&mut self, max_size: u64) -> &mut Self {
+        self.max_size = max_size;
+        self
+    }
+
+    #[allow(dead_code)]
+    fn set_num_slots(&mut self, num_slots: u32) -> &mut Self {
+        self.num_slots = num_slots;
         self
     }
 }
@@ -388,7 +383,7 @@ impl ToQemuParams for Cpu {
 /// Error type for CCW Subchannel operations
 #[derive(Debug)]
 #[allow(dead_code)]
-enum CcwError {
+pub enum CcwError {
     DeviceAlreadyExists(String), // Error when trying to add an existing device
     #[allow(dead_code)]
     DeviceNotFound(String), // Error when trying to remove a nonexistent device
@@ -419,7 +414,7 @@ impl CcwSubChannel {
     /// # Returns
     /// - `Result<u32, CcwError>`: slot index of the added device
     ///   or an error if the device already exists
-    fn add_device(&mut self, dev_id: &str) -> Result<u32, CcwError> {
+    pub fn add_device(&mut self, dev_id: &str) -> Result<u32, CcwError> {
         if self.devices.contains_key(dev_id) {
             Err(CcwError::DeviceAlreadyExists(dev_id.to_owned()))
         } else {
@@ -438,8 +433,7 @@ impl CcwSubChannel {
     /// # Returns
     /// - `Result<(), CcwError>`: Ok(()) if the device was removed
     ///   or an error if the device was not found
-    #[allow(dead_code)]
-    fn remove_device(&mut self, dev_id: &str) -> Result<(), CcwError> {
+    pub fn remove_device(&mut self, dev_id: &str) -> Result<(), CcwError> {
         if self.devices.remove(dev_id).is_some() {
             Ok(())
         } else {
@@ -447,15 +441,28 @@ impl CcwSubChannel {
         }
     }
 
-    /// Formats the CCW address for a given slot
+    /// Formats the CCW address for a given slot.
+    /// Uses the 0xfe channel subsystem ID used by QEMU.
     ///
     /// # Arguments
     /// - `slot`: slot index
     ///
     /// # Returns
     /// - `String`: formatted CCW address (e.g. `fe.0.0000`)
-    fn address_format_ccw(&self, slot: u32) -> String {
+    pub fn address_format_ccw(&self, slot: u32) -> String {
         format!("fe.{:x}.{:04x}", self.addr, slot)
+    }
+
+    /// Formats the guest-visible CCW address for a given slot.
+    /// Uses channel subsystem ID 0 (guest perspective).
+    ///
+    /// # Arguments
+    /// - `slot`: slot index
+    ///
+    /// # Returns
+    /// - `String`: formatted guest-visible CCW address (e.g. `0.0.0000`)
+    pub fn address_format_ccw_for_virt_server(&self, slot: u32) -> String {
+        format!("0.{:x}.{:04x}", self.addr, slot)
     }
 
     /// Sets the address of the subchannel.
@@ -1872,6 +1879,7 @@ struct ObjectSevSnpGuest {
     reduced_phys_bits: u32,
     kernel_hashes: bool,
     host_data: Option<String>,
+    policy: u32,
     is_snp: bool,
 }
 
@@ -1883,8 +1891,14 @@ impl ObjectSevSnpGuest {
             reduced_phys_bits,
             kernel_hashes: true,
             host_data,
+            policy: 0x30000,
             is_snp,
         }
+    }
+
+    fn set_policy(&mut self, policy: u32) -> &mut Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -1908,6 +1922,7 @@ impl ToQemuParams for ObjectSevSnpGuest {
                 "kernel-hashes={}",
                 if self.kernel_hashes { "on" } else { "off" }
             ));
+            params.push(format!("policy=0x{:x}", self.policy));
             if let Some(host_data) = &self.host_data {
                 params.push(format!("host-data={host_data}"))
             }
@@ -2270,6 +2285,12 @@ impl<'a> QemuCmdLine<'a> {
         Ok(qemu_cmd_line)
     }
 
+    /// Takes ownership of the CCW subchannel, leaving `None` in its place.
+    /// Used to transfer boot-time CCW state to Qmp for hotplug allocation.
+    pub fn take_ccw_subchannel(&mut self) -> Option<CcwSubChannel> {
+        self.ccw_subchannel.take()
+    }
+
     fn add_monitor(&mut self, proto: &str) -> Result<()> {
         let monitor = QmpSocket::new(self.id.as_str(), MonitorProtocol::new(proto))?;
         self.devices.push(Box::new(monitor));
@@ -2557,13 +2578,19 @@ impl<'a> QemuCmdLine<'a> {
         firmware: &str,
         host_data: &Option<String>,
     ) {
-        let sev_snp_object =
+        // For SEV-SNP, memory overcommit is not supported. we only set the memory size.
+        self.memory.set_maxmem_size(0).set_num_slots(0);
+
+        let mut sev_snp_object =
             ObjectSevSnpGuest::new(true, cbitpos, phys_addr_reduction, host_data.clone());
+        sev_snp_object.set_policy(self.config.security_info.snp_guest_policy);
+
         self.devices.push(Box::new(sev_snp_object));
 
         self.devices.push(Box::new(Bios::new(firmware.to_owned())));
 
         self.machine
+            .set_kernel_irqchip("split")
             .set_confidential_guest_support("snp")
             .set_nvdimm(false);
 

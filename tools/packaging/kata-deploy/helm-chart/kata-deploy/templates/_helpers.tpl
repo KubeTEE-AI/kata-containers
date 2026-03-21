@@ -141,11 +141,21 @@ Uses null-based defaults for disableAll support:
 {{- end -}}
 
 {{/*
-Get default shim for a specific architecture from structured config
+Get default shim for a specific architecture from structured config.
+Returns the configured default shim only if it is actually enabled and
+supports the requested architecture. Returns empty string otherwise so
+that callers can skip setting the env var rather than propagating a
+bogus value that would cause kata-deploy to fail at runtime.
 */}}
 {{- define "kata-deploy.getDefaultShimForArch" -}}
 {{- $arch := .arch -}}
-{{- index .root.Values.defaultShim $arch -}}
+{{- $defaultShim := index .root.Values.defaultShim $arch -}}
+{{- if $defaultShim -}}
+{{- $enabledShims := include "kata-deploy.getEnabledShimsForArch" (dict "root" .root "arch" $arch) | trim | splitList " " -}}
+{{- if has $defaultShim $enabledShims -}}
+{{- $defaultShim -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -322,6 +332,36 @@ Builds per-shim semicolon-separated list: "shim1=value1;shim2=value2"
 {{- end -}}
 {{- end -}}
 {{- join ";" $proxies -}}
+{{- end -}}
+
+{{/*
+Main kata-deploy image reference for the DaemonSet.
+Supports tag (reference:tag) and digest (reference@sha256:...) formats.
+When reference contains "@" (digest), use reference as-is; otherwise use reference:tag (tag defaults to Chart.AppVersion).
+*/}}
+{{- define "kata-deploy.image" -}}
+{{- $ref := .Values.image.reference -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag | toString -}}
+{{- if contains "@" $ref -}}
+{{- $ref -}}
+{{- else -}}
+{{- printf "%s:%s" $ref $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+kubectl image reference for verification and cleanup jobs.
+Supports tag (reference:tag) and digest (reference@sha256:...) formats.
+When reference already contains "@" (digest) or tag is empty, use reference as-is.
+*/}}
+{{- define "kata-deploy.kubectlImage" -}}
+{{- $ref := .Values.kubectlImage.reference -}}
+{{- $tag := .Values.kubectlImage.tag | toString -}}
+{{- if or (contains "@" $ref) (eq $tag "") -}}
+{{- $ref -}}
+{{- else -}}
+{{- printf "%s:%s" $ref $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

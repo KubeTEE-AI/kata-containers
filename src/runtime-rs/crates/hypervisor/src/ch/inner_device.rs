@@ -27,6 +27,7 @@ use ch_config::ch_api::{
 };
 use ch_config::convert::DEFAULT_NUM_PCI_SEGMENTS;
 use ch_config::DiskConfig;
+use ch_config::ImageType;
 use ch_config::{net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, VsockConfig};
 use kata_sys_util::netns::NetnsGuard;
 use kata_types::config::hypervisor::RateLimiterConfig;
@@ -460,17 +461,26 @@ impl CloudHypervisorInner {
                     shared_fs_devices.push(fs_cfg);
                 }
                 DeviceType::Network(net_device) => {
+                    let network_queues_pairs =
+                        self.hypervisor_config().network_info.network_queues as usize;
+
                     let mut net_config = NetConfig::try_from(net_device.config.clone())?;
                     // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
                     net_config.tap = None;
                     net_config.id = None;
+
+                    net_config.num_queues = network_queues_pairs * 2;
+                    info!(
+                        sl!(),
+                        "network device queue pairs {:?}", network_queues_pairs
+                    );
 
                     // we need ensure opening network device happens in netns.
                     let netns = self.netns.clone().unwrap_or_default();
                     let _netns_guard = NetnsGuard::new(&netns).context("new netns guard")?;
                     let fds = open_named_tuntap(
                         &net_device.config.host_dev_name,
-                        net_device.config.queue_num as u32,
+                        network_queues_pairs as u32,
                     )
                     .context("open named tuntap")?
                     .into_iter()
@@ -544,6 +554,7 @@ impl TryFrom<BlockConfig> for DiskConfig {
             readonly: blkcfg.is_readonly,
             num_queues: blkcfg.num_queues,
             queue_size: blkcfg.queue_size as u16,
+            image_type: ImageType::Raw,
             ..Default::default()
         };
 

@@ -337,7 +337,12 @@ func (s *stratovirt) getKernelParams(machineType string, initrdPath string) (str
 	var kernelParams []Param
 
 	if initrdPath == "" {
-		params, err := GetKernelRootParams(s.config.RootfsType, true, false)
+		params, err := GetKernelRootParams(
+			s.config.RootfsType,
+			true,
+			false,
+			s.config.KernelVerityParams,
+		)
 		if err != nil {
 			return "", err
 		}
@@ -536,10 +541,10 @@ func (s *stratovirt) appendNetwork(ctx context.Context, devices []VirtioDev, end
 	devices = append(devices, netDevice{
 		devType:  "tap",
 		id:       name,
-		ifname:   endpoint.NetworkPair().TapInterface.TAPIface.Name,
+		ifname:   endpoint.NetworkPair().TAPIface.Name,
 		netdev:   name,
 		deviceID: name,
-		FDs:      endpoint.NetworkPair().TapInterface.VMFds,
+		FDs:      endpoint.NetworkPair().VMFds,
 		mac:      endpoint.HardwareAddr(),
 		driver:   mmioBus,
 	})
@@ -1125,7 +1130,7 @@ func (s *stratovirt) AddDevice(ctx context.Context, devInfo interface{}, devType
 		s.fds = append(s.fds, v.VhostFd)
 		s.svConfig.devices = s.appendVhostVsock(ctx, s.svConfig.devices, v)
 	case Endpoint:
-		s.fds = append(s.fds, v.NetworkPair().TapInterface.VMFds...)
+		s.fds = append(s.fds, v.NetworkPair().VMFds...)
 		s.svConfig.devices = s.appendNetwork(ctx, s.svConfig.devices, v)
 	case config.BlockDrive:
 		s.svConfig.devices = s.appendBlock(ctx, s.svConfig.devices)

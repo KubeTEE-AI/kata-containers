@@ -25,16 +25,51 @@ struct ContainerdRuntimeParams {
     snapshotter: Option<String>,
 }
 
-fn get_containerd_pluginid(config_file: &str) -> Result<&'static str> {
+/// Plugin ID for CRI runtime in containerd config v3 (version = 3).
+const CONTAINERD_V3_RUNTIME_PLUGIN_ID: &str = "\"io.containerd.cri.v1.runtime\"";
+/// Plugin ID for CRI in containerd config v2 (version = 2).
+const CONTAINERD_V2_CRI_PLUGIN_ID: &str = "\"io.containerd.grpc.v1.cri\"";
+/// Legacy plugin key when config has no version (pre-v2).
+const CONTAINERD_LEGACY_CRI_PLUGIN_ID: &str = "cri";
+/// Plugin ID for CRI images in containerd config v3 (version = 3).
+const CONTAINERD_CRI_IMAGES_PLUGIN_ID: &str = "\"io.containerd.cri.v1.images\"";
+/// Plugin table for CRI containerd in v2 (disable_snapshot_annotations lives here).
+const CONTAINERD_CRI_CONTAINERD_TABLE_V2: &str = "\"io.containerd.grpc.v1.cri\".containerd";
+
+/// Reads config and returns the CRI plugin ID used for *runtime* config (runtimes, snapshotter-per-runtime).
+pub(crate) fn get_containerd_pluginid(config_file: &str) -> Result<&'static str> {
     let content = fs::read_to_string(config_file)
         .with_context(|| format!("Failed to read containerd config file: {}", config_file))?;
 
     if content.contains("version = 3") {
-        Ok("\"io.containerd.cri.v1.runtime\"")
+        Ok(CONTAINERD_V3_RUNTIME_PLUGIN_ID)
     } else if content.contains("version = 2") {
-        Ok("\"io.containerd.grpc.v1.cri\"")
+        Ok(CONTAINERD_V2_CRI_PLUGIN_ID)
     } else {
-        Ok("cri")
+        Ok(CONTAINERD_LEGACY_CRI_PLUGIN_ID)
+    }
+}
+
+/// True when the containerd config is v3 (version = 3), i.e. we use the split CRI plugins.
+fn is_containerd_v3_config(pluginid: &str) -> bool {
+    pluginid == CONTAINERD_V3_RUNTIME_PLUGIN_ID
+}
+
+/// Maps the runtime plugin ID (from get_containerd_pluginid) to the plugin table where
+/// disable_snapshot_annotations lives. In v3 that's the *images* plugin; in v2 the CRI .containerd subtable.
+pub(crate) fn pluginid_for_snapshotter_annotations(
+    runtime_plugin_id: &str,
+    config_file: &str,
+) -> Result<&'static str> {
+    if runtime_plugin_id == CONTAINERD_V3_RUNTIME_PLUGIN_ID {
+        Ok(CONTAINERD_CRI_IMAGES_PLUGIN_ID)
+    } else if runtime_plugin_id == CONTAINERD_V2_CRI_PLUGIN_ID {
+        Ok(CONTAINERD_CRI_CONTAINERD_TABLE_V2)
+    } else {
+        anyhow::bail!(
+            "Containerd config {} has no \"version = 2\" or \"version = 3\"; cannot determine CRI plugin for snapshotter config",
+            config_file
+        )
     }
 }
 
@@ -95,6 +130,26 @@ fn write_containerd_runtime_config(
             &format!("{runtime_table}.snapshotter"),
             snapshotter,
         )?;
+        // In containerd config v3 the CRI plugin is split into runtime and images,
+        // and setting the snapshotter only on the runtime plugin is not enough for image
+        // pull/prepare.
+        //
+        // The images plugin must have runtime_platforms.<runtime>.snapshotter so it
+        // uses the correct snapshotter per runtime (e.g. nydus, erofs).
+        //
+        // A PR on the containerd side is open so we can rely on the runtime plugin
+        // snapshotter alone: https://github.com/containerd/containerd/pull/12836
+        if is_containerd_v3_config(pluginid) {
+            toml_utils::set_toml_value(
+                config_file,
+                &format!(
+                    ".plugins.{}.runtime_platforms.\"{}\".snapshotter",
+                    CONTAINERD_CRI_IMAGES_PLUGIN_ID,
+                    params.runtime_name
+                ),
+                snapshotter,
+            )?;
+        }
     }
 
     Ok(())
@@ -116,7 +171,10 @@ pub async fn configure_containerd_runtime(
 
     let paths = config.get_containerd_paths(runtime).await?;
     let configuration_file = get_containerd_output_path(&paths);
-    let pluginid = get_containerd_pluginid(&paths.config_file)?;
+    let pluginid = match paths.plugin_id.as_deref() {
+        Some(plugin_id) => plugin_id,
+        None => get_containerd_pluginid(&paths.config_file)?,
+    };
 
     log::info!(
         "configure_containerd_runtime: Writing to {:?}, pluginid={}",
@@ -187,7 +245,10 @@ pub async fn configure_custom_containerd_runtime(
 
     let paths = config.get_containerd_paths(runtime).await?;
     let configuration_file = get_containerd_output_path(&paths);
-    let pluginid = get_containerd_pluginid(&paths.config_file)?;
+    let pluginid = match paths.plugin_id.as_deref() {
+        Some(plugin_id) => plugin_id,
+        None => get_containerd_pluginid(&paths.config_file)?,
+    };
 
     log::info!(
         "configure_custom_containerd_runtime: Writing to {:?}, pluginid={}",
@@ -225,7 +286,9 @@ pub async fn configure_custom_containerd_runtime(
         snapshotter,
     };
 
-    write_containerd_runtime_config(&configuration_file, pluginid, &params)
+    write_containerd_runtime_config(&configuration_file, pluginid, &params)?;
+
+    Ok(())
 }
 
 pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> {
@@ -325,13 +388,22 @@ pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
     let paths = config.get_containerd_paths(runtime).await?;
 
     if paths.use_drop_in {
-        // Remove drop-in from imports array (if imports are used)
+        // Remove drop-in from imports array (if we added it; K3s/RKE2 have imports_file = None)
         if let Some(imports_file) = &paths.imports_file {
             toml_utils::remove_from_toml_array(
                 Path::new(imports_file),
                 ".imports",
                 &format!("\"{}\"", paths.drop_in_file),
             )?;
+        }
+        // Remove the drop-in file
+        let drop_in_path = if paths.drop_in_file.starts_with("/etc/containerd/") {
+            Path::new(&paths.drop_in_file).to_path_buf()
+        } else {
+            Path::new("/host").join(paths.drop_in_file.trim_start_matches('/'))
+        };
+        if drop_in_path.exists() {
+            fs::remove_file(&drop_in_path)?;
         }
         return Ok(());
     }
@@ -347,13 +419,27 @@ pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
     Ok(())
 }
 
-/// Setup containerd config files based on runtime type
-pub fn setup_containerd_config_files(runtime: &str, config: &Config) -> Result<()> {
+/// Setup containerd config files based on runtime type.
+/// For K3s/RKE2, we only run when the rendered config already has the drop-in import
+/// (get_containerd_paths bails otherwise). We create the drop-in dir and empty file.
+pub async fn setup_containerd_config_files(runtime: &str, config: &Config) -> Result<()> {
     match runtime {
         "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server" => {
-            let tmpl_file = format!("{}.tmpl", config.containerd_conf_file);
-            if !Path::new(&tmpl_file).exists() && Path::new(&config.containerd_conf_file).exists() {
-                fs::copy(&config.containerd_conf_file, &tmpl_file)?;
+            // K3s/RKE2: rendered config must already import the drop-in dir (checked in get_containerd_paths).
+            // Create the drop-in dir and empty file only.
+            let paths = config.get_containerd_paths(runtime).await?;
+            let drop_in_path = if paths.drop_in_file.starts_with("/etc/containerd/") {
+                Path::new(&paths.drop_in_file).to_path_buf()
+            } else {
+                Path::new("/host").join(paths.drop_in_file.trim_start_matches('/'))
+            };
+            if let Some(parent) = drop_in_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create K3s/RKE2 drop-in dir: {parent:?}"))?;
+            }
+            if !drop_in_path.exists() {
+                fs::write(&drop_in_path, "")
+                    .with_context(|| format!("Failed to create K3s/RKE2 drop-in file: {drop_in_path:?}"))?;
             }
         }
         "k0s-worker" | "k0s-controller" => {
@@ -516,102 +602,201 @@ pub fn snapshotter_handler_mapping_validation_check(config: &Config) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::toml as toml_utils;
+    use rstest::rstest;
+    use std::path::Path;
+    use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_1_6_with_mapping() {
-        // Version 1.6 with snapshotter mapping should fail
-        let result = check_containerd_snapshotter_version_support("containerd://1.6.28", true);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("kata-deploy only supports snapshotter configuration with containerd 1.7 or newer"));
+    fn make_params(
+        runtime_name: &str,
+        snapshotter: Option<&str>,
+    ) -> ContainerdRuntimeParams {
+        ContainerdRuntimeParams {
+            runtime_name: runtime_name.to_string(),
+            runtime_path: "\"/opt/kata/bin/kata-runtime\"".to_string(),
+            config_path: "\"/opt/kata/share/defaults/kata-containers/configuration-qemu.toml\""
+                .to_string(),
+            pod_annotations: "[\"io.katacontainers.*\"]",
+            snapshotter: snapshotter.map(|s| s.to_string()),
+        }
     }
 
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_1_6_without_mapping() {
-        // Version 1.6 without snapshotter mapping should pass (no mapping means no check needed)
-        let result = check_containerd_snapshotter_version_support("containerd://1.6.28", false);
-        assert!(result.is_ok());
-    }
+    /// CRI images runtime_platforms snapshotter is set only for v3 config when a snapshotter is configured.
+    #[rstest]
+    #[case(CONTAINERD_V3_RUNTIME_PLUGIN_ID, Some("\"nydus\""), "kata-qemu", true)]
+    #[case(CONTAINERD_V2_CRI_PLUGIN_ID, Some("\"nydus\""), "kata-qemu", false)]
+    #[case(CONTAINERD_V3_RUNTIME_PLUGIN_ID, None, "kata-qemu", false)]
+    #[case(CONTAINERD_V3_RUNTIME_PLUGIN_ID, Some("\"erofs\""), "kata-clh", true)]
+    fn test_write_containerd_runtime_config_cri_images_runtime_platforms_snapshotter(
+        #[case] pluginid: &str,
+        #[case] snapshotter: Option<&str>,
+        #[case] runtime_name: &str,
+        #[case] expect_runtime_platforms_set: bool,
+    ) {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "").unwrap();
 
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_1_7_with_mapping() {
-        // Version 1.7 with snapshotter mapping should pass
-        let result = check_containerd_snapshotter_version_support("containerd://1.7.15", true);
-        assert!(result.is_ok());
-    }
+        let params = make_params(runtime_name, snapshotter);
+        write_containerd_runtime_config(path, pluginid, &params).unwrap();
 
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_2_0_with_mapping() {
-        // Version 2.0 with snapshotter mapping should pass
-        let result = check_containerd_snapshotter_version_support("containerd://2.0.0", true);
-        assert!(result.is_ok());
-    }
+        let images_snapshotter_path = format!(
+            ".plugins.\"io.containerd.cri.v1.images\".runtime_platforms.\"{}\".snapshotter",
+            runtime_name
+        );
+        let result = toml_utils::get_toml_value(Path::new(path), &images_snapshotter_path);
 
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_without_prefix() {
-        // Version without containerd:// prefix should still work
-        let result = check_containerd_snapshotter_version_support("1.6.28", true);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_1_6_variants() {
-        // Test various 1.6.x versions
-        assert!(check_containerd_snapshotter_version_support("containerd://1.6.0", true).is_err());
-        assert!(check_containerd_snapshotter_version_support("containerd://1.6.28", true).is_err());
-        assert!(check_containerd_snapshotter_version_support("containerd://1.6.999", true).is_err());
-    }
-
-    #[test]
-    fn test_check_containerd_snapshotter_version_support_1_7_variants() {
-        // Test various 1.7+ versions should pass
-        assert!(check_containerd_snapshotter_version_support("containerd://1.7.0", true).is_ok());
-        assert!(check_containerd_snapshotter_version_support("containerd://1.7.15", true).is_ok());
-        assert!(check_containerd_snapshotter_version_support("containerd://1.8.0", true).is_ok());
-    }
-
-    #[test]
-    fn test_check_containerd_erofs_version_support() {
-        // Versions that should pass (2.2.0+)
-        let passing_versions = [
-            "containerd://2.2.0",
-            "containerd://2.2.0-rc.1",
-            "containerd://2.2.1",
-            "containerd://2.3.0",
-            "containerd://3.0.0",
-            "containerd://2.3.0-beta.0",
-            "2.2.0", // without prefix
-        ];
-        for version in passing_versions {
+        if expect_runtime_platforms_set {
+            let value = result.unwrap_or_else(|e| {
+                panic!(
+                    "expected CRI images runtime_platforms.{} snapshotter to be set: {}",
+                    runtime_name, e
+                )
+            });
+            assert_eq!(
+                value,
+                snapshotter.unwrap().trim_matches('"'),
+                "runtime_platforms snapshotter value"
+            );
+        } else {
             assert!(
-                check_containerd_erofs_version_support(version).is_ok(),
-                "Expected {} to pass",
-                version
+                result.is_err(),
+                "expected CRI images runtime_platforms.{} snapshotter not to be set for pluginid={:?} snapshotter={:?}",
+                runtime_name,
+                pluginid,
+                snapshotter
             );
         }
+    }
 
-        // Versions that should fail (< 2.2.0)
-        let failing_versions = [
-            ("containerd://2.1.0", "containerd must be 2.2.0 or newer"),
-            ("containerd://2.1.5-rc.1", "containerd must be 2.2.0 or newer"),
-            ("containerd://2.0.0", "containerd must be 2.2.0 or newer"),
-            ("containerd://1.7.0", "containerd must be 2.2.0 or newer"),
-            ("containerd://1.6.28", "containerd must be 2.2.0 or newer"),
-            ("2.1.0", "containerd must be 2.2.0 or newer"), // without prefix
-            ("invalid", "Invalid containerd version format"),
-            ("containerd://abc.2.0", "Failed to parse major version"),
-        ];
-        for (version, expected_error) in failing_versions {
-            let result = check_containerd_erofs_version_support(version);
-            assert!(result.is_err(), "Expected {} to fail", version);
+    /// pluginid_for_snapshotter_annotations maps runtime plugin id to the table where disable_snapshot_annotations lives.
+    #[rstest]
+    #[case(CONTAINERD_V3_RUNTIME_PLUGIN_ID, CONTAINERD_CRI_IMAGES_PLUGIN_ID, false)]
+    #[case(CONTAINERD_V2_CRI_PLUGIN_ID, CONTAINERD_CRI_CONTAINERD_TABLE_V2, false)]
+    #[case(CONTAINERD_LEGACY_CRI_PLUGIN_ID, "", true)]
+    fn test_pluginid_for_snapshotter_annotations(
+        #[case] runtime_plugin_id: &str,
+        #[case] expected_plugin_id: &str,
+        #[case] expect_err: bool,
+    ) {
+        let config_file = "/etc/containerd/config.toml";
+        let result = pluginid_for_snapshotter_annotations(runtime_plugin_id, config_file);
+        if expect_err {
+            let err = result.unwrap_err();
             assert!(
-                result.unwrap_err().to_string().contains(expected_error),
-                "Expected error for {} to contain '{}'",
-                version,
-                expected_error
+                err.to_string().contains(config_file),
+                "error should mention config file: {}",
+                err
+            );
+            assert!(
+                err.to_string().contains("version = 2") || err.to_string().contains("version = 3"),
+                "error should mention version: {}",
+                err
+            );
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                expected_plugin_id,
+                "runtime_plugin_id={}",
+                runtime_plugin_id
             );
         }
+    }
+
+    /// Written containerd config (e.g. drop-in) must not start with blank lines when written to an initially empty file.
+    #[rstest]
+    #[case(CONTAINERD_V3_RUNTIME_PLUGIN_ID)]
+    #[case(CONTAINERD_V2_CRI_PLUGIN_ID)]
+    fn test_write_containerd_runtime_config_empty_file_no_leading_newlines(
+        #[case] pluginid: &str,
+    ) {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "").unwrap();
+
+        let params = make_params("kata-qemu", Some("\"nydus\""));
+        write_containerd_runtime_config(path, pluginid, &params).unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.starts_with('\n'),
+            "containerd config must not start with newline(s), got {} leading newlines (pluginid={})",
+            content.chars().take_while(|&c| c == '\n').count(),
+            pluginid
+        );
+        assert!(
+            content.trim_start().starts_with('['),
+            "config should start with a TOML table"
+        );
+    }
+
+    #[rstest]
+    #[case("containerd://1.6.28", true, false, Some("kata-deploy only supports snapshotter configuration with containerd 1.7 or newer"))]
+    #[case("containerd://1.6.28", false, true, None)]
+    #[case("containerd://1.6.0", true, false, None)]
+    #[case("containerd://1.6.999", true, false, None)]
+    #[case("containerd://1.7.0", true, true, None)]
+    #[case("containerd://1.7.15", true, true, None)]
+    #[case("containerd://1.8.0", true, true, None)]
+    #[case("containerd://2.0.0", true, true, None)]
+    #[case("1.6.28", true, false, None)]
+    fn test_check_containerd_snapshotter_version_support(
+        #[case] version: &str,
+        #[case] has_mapping: bool,
+        #[case] expect_ok: bool,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let result = check_containerd_snapshotter_version_support(version, has_mapping);
+        if expect_ok {
+            assert!(result.is_ok(), "expected ok for version={} has_mapping={}", version, has_mapping);
+        } else {
+            assert!(result.is_err(), "expected err for version={} has_mapping={}", version, has_mapping);
+            if let Some(sub) = expected_error_substring {
+                assert!(
+                    result.unwrap_err().to_string().contains(sub),
+                    "error should contain {:?}",
+                    sub
+                );
+            }
+        }
+    }
+
+    #[rstest]
+    #[case("containerd://2.2.0")]
+    #[case("containerd://2.2.0-rc.1")]
+    #[case("containerd://2.2.1")]
+    #[case("containerd://2.3.0")]
+    #[case("containerd://3.0.0")]
+    #[case("containerd://2.3.0-beta.0")]
+    #[case("2.2.0")]
+    fn test_check_containerd_erofs_version_support_passing(#[case] version: &str) {
+        assert!(
+            check_containerd_erofs_version_support(version).is_ok(),
+            "Expected {} to pass",
+            version
+        );
+    }
+
+    #[rstest]
+    #[case("containerd://2.1.0", "containerd must be 2.2.0 or newer")]
+    #[case("containerd://2.1.5-rc.1", "containerd must be 2.2.0 or newer")]
+    #[case("containerd://2.0.0", "containerd must be 2.2.0 or newer")]
+    #[case("containerd://1.7.0", "containerd must be 2.2.0 or newer")]
+    #[case("containerd://1.6.28", "containerd must be 2.2.0 or newer")]
+    #[case("2.1.0", "containerd must be 2.2.0 or newer")]
+    #[case("invalid", "Invalid containerd version format")]
+    #[case("containerd://abc.2.0", "Failed to parse major version")]
+    fn test_check_containerd_erofs_version_support_failing(
+        #[case] version: &str,
+        #[case] expected_error: &str,
+    ) {
+        let result = check_containerd_erofs_version_support(version);
+        assert!(result.is_err(), "Expected {} to fail", version);
+        assert!(
+            result.unwrap_err().to_string().contains(expected_error),
+            "Expected error for {} to contain '{}'",
+            version,
+            expected_error
+        );
     }
 }

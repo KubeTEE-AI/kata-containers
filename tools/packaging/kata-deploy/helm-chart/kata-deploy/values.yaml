@@ -6,6 +6,10 @@ image:
   reference: quay.io/kata-containers/kata-deploy
   tag: ""
 
+kubectlImage:
+  reference: quay.io/kata-containers/kubectl
+  tag: latest
+
 k8sDistribution: "k8s"  # k8s, k3s, rke2, k0s, microk8s
 
 # Node selector and tolerations to control which nodes the kata-deploy daemonset runs on
@@ -46,6 +50,28 @@ snapshotter:
 #     disableAll: true
 #     qemu:
 #       enabled: true  # Only qemu is enabled
+#
+# All configurable keys per shim (all optional unless noted):
+#   shims:
+#     <shim-name>:
+#       enabled: ~                    # true | false | ~ (null = follow disableAll)
+#       supportedArches:              # list of supported architectures
+#         - amd64
+#       allowedHypervisorAnnotations: []  # hypervisor annotations to pass through
+#       containerd:
+#         snapshotter: ""             # e.g. nydus, erofs, devmapper, or "" for default
+#         forceGuestPull: false       # force guest-side image pull in containerd
+#       crio:
+#         guestPull: false            # enable guest-pull in CRI-O
+#       agent:
+#         httpsProxy: ""             # HTTPS proxy for the Kata agent
+#         noProxy: ""                # no-proxy list for the Kata agent
+#       runtimeClass:
+#         nodeSelector:              # extra node selectors added to the RuntimeClass
+#           example.io/feature: "true"
+#         overhead:                  # override pod overhead (falls back to built-in defaults)
+#           memory: "160Mi"
+#           cpu: "250m"
 shims:
   disableAll: false
 
@@ -114,6 +140,12 @@ shims:
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
+    runtimeClass:
+      # This label is automatically added by gpu-operator. Override it
+      # if you want to use a different label.
+      # Uncomment once GPU Operator v26.3 is out
+      # nodeSelector:
+        # nvidia.com/cc.ready.state: "false"
 
   qemu-nvidia-gpu-snp:
     enabled: ~
@@ -128,6 +160,15 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    runtimeClass:
+      # These labels are automatically added by gpu-operator and NFD
+      # respectively. Override if you want to use a different label.
+      # If you don't have NFD, you need to add the snp label by other
+      # means to your SNP nodes.
+      nodeSelector:
+        # Uncomment once GPU Operator v26.3 is out
+        # nvidia.com/cc.ready.state: "true"
+        amd.feature.node.kubernetes.io/snp: "true"
 
   qemu-nvidia-gpu-tdx:
     enabled: ~
@@ -142,6 +183,15 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    runtimeClass:
+      # These labels are automatically added by gpu-operator and NFD
+      # respectively. Override if you want to use a different label.
+      # If you don't have NFD, you need to add the tdx label by other
+      # means to your TDX nodes.
+      nodeSelector:
+        # Uncomment once GPU Operator v26.3 is out
+        # nvidia.com/cc.ready.state: "true"
+        intel.feature.node.kubernetes.io/tdx: "true"
 
   qemu-snp:
     enabled: ~
@@ -275,6 +325,7 @@ shims:
     enabled: false
     supportedArches:
       - amd64
+      - ppc64le
       - s390x
     allowedHypervisorAnnotations: []
     containerd:
