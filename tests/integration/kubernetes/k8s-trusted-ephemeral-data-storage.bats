@@ -9,8 +9,6 @@ load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
     is_confidential_runtime_class || skip "Only supported for CoCo"
-    [[ "$(uname -m)" == "s390x" ]] && skip "Not supported on s390x"
-    [[ "${KATA_HYPERVISOR}" == *-runtime-rs ]] && skip "Not supported with runtime-rs"
 
     setup_common
     get_pod_config_dir
@@ -87,8 +85,6 @@ setup() {
 
 teardown() {
     is_confidential_runtime_class || skip "Only supported for CoCo"
-    [[ "$(uname -m)" == "s390x" ]] && skip "Not supported on s390x"
-    [[ "${KATA_HYPERVISOR}" == *-runtime-rs ]] && skip "Not supported with runtime-rs"
 
     confidential_teardown_common "${node}" "${node_start_time:-}"
 }

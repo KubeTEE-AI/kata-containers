@@ -174,6 +174,7 @@ const (
 	grpcGetIPTablesRequest                    = "grpc.GetIPTablesRequest"
 	grpcSetIPTablesRequest                    = "grpc.SetIPTablesRequest"
 	grpcSetPolicyRequest                      = "grpc.SetPolicyRequest"
+	grpcGetDiagnosticDataRequest              = "grpc.GetDiagnosticDataRequest"
 )
 
 // newKataAgent returns an agent from an agent type.
@@ -292,15 +293,16 @@ func ephemeralPath() string {
 // KataAgentConfig is a structure storing information needed
 // to reach the Kata Containers agent.
 type KataAgentConfig struct {
-	KernelModules      []string
-	ContainerPipeSize  uint32
-	DialTimeout        uint32
-	CdhApiTimeout      uint32
-	LongLiveConn       bool
-	Debug              bool
-	Trace              bool
-	EnableDebugConsole bool
-	Policy             string
+	KernelModules        []string
+	ContainerPipeSize    uint32
+	DialTimeout          uint32
+	CdhApiTimeout        uint32
+	LaunchProcessTimeout uint32
+	LongLiveConn         bool
+	Debug                bool
+	Trace                bool
+	EnableDebugConsole   bool
+	Policy               string
 }
 
 // KataAgentState is the structure describing the data stored from this
@@ -364,6 +366,11 @@ func KataAgentKernelParams(config KataAgentConfig) []Param {
 	if config.CdhApiTimeout > 0 {
 		cdhApiTimeout := strconv.FormatUint(uint64(config.CdhApiTimeout), 10)
 		params = append(params, Param{Key: vcAnnotations.CdhApiTimeoutKernelParam, Value: cdhApiTimeout})
+	}
+
+	if config.LaunchProcessTimeout > 0 {
+		launchProcessTimeout := strconv.FormatUint(uint64(config.LaunchProcessTimeout), 10)
+		params = append(params, Param{Key: vcAnnotations.LaunchProcessTimeoutKernelParam, Value: launchProcessTimeout})
 	}
 
 	return params
@@ -2403,6 +2410,9 @@ func (k *kataAgent) installReqFunc(c *kataclient.AgentClient) {
 	k.reqHandlers[grpcSetPolicyRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.SetPolicy(ctx, req.(*grpc.SetPolicyRequest))
 	}
+	k.reqHandlers[grpcGetDiagnosticDataRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.GetDiagnosticData(ctx, req.(*grpc.GetDiagnosticDataRequest))
+	}
 }
 
 func (k *kataAgent) getReqContext(ctx context.Context, reqName string) (newCtx context.Context, cancel context.CancelFunc) {
@@ -2733,6 +2743,17 @@ func (k *kataAgent) setPolicy(ctx context.Context, policy string) error {
 		return grpcStatus.Errorf(codes.DeadlineExceeded, "SetPolicyRequest timed out")
 	}
 	return err
+}
+
+func (k *kataAgent) getDiagnosticData(ctx context.Context, logType string, containerID string) (string, error) {
+	resp, err := k.sendReq(ctx, &grpc.GetDiagnosticDataRequest{
+		LogType:     logType,
+		ContainerId: containerID,
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.(*grpc.GetDiagnosticDataResponse).Data, nil
 }
 
 // IsNydusRootFSType checks if the given mount type indicates Nydus is used.
