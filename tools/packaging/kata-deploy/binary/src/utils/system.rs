@@ -7,9 +7,11 @@ use anyhow::{Context, Result};
 use std::process::Command;
 
 pub const RUST_SHIMS: &[&str] = &[
+    "clh-azure-runtime-rs",
     "clh-runtime-rs",
     "dragonball",
     "qemu-runtime-rs",
+    "qemu-nvidia-cpu-runtime-rs",
     "qemu-nvidia-gpu-runtime-rs",
     "qemu-nvidia-gpu-snp-runtime-rs",
     "qemu-nvidia-gpu-tdx-runtime-rs",
@@ -213,7 +215,7 @@ mod tests {
             "qemu-snp",
             "qemu-se",
             "qemu-coco-dev",
-            "qemu-cca",
+            "qemu-nvidia-cpu",
             "qemu-nvidia-gpu",
             "qemu-nvidia-gpu-tdx",
             "qemu-nvidia-gpu-snp",

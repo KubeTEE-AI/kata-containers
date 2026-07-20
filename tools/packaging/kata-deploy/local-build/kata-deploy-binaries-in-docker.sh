@@ -49,8 +49,10 @@ if [[ "${CROSS_BUILD}" == "true" ]]; then
        [[ -z "${r}" ]] && sudo docker run --privileged --rm tonistiigi/binfmt --install "${TARGET_ARCH}"
 fi
 
-if [[ "${script_dir}" != "${PWD}" ]]; then
-	ln -sf "${script_dir}/build" "${PWD}/build"
+if [[ "${script_dir}" != "${PWD}" && ! -L "${PWD}/build" ]]; then
+	# If a parallel job creates the link between the check and our ln,
+	# accept that and move on; any other failure aborts.
+	ln -s "${script_dir}/build" "${PWD}/build" 2>/dev/null || [[ -L "${PWD}/build" ]]
 fi
 
 # This is the gid of the "docker" group on host. In case of docker in docker builds
@@ -66,7 +68,9 @@ fi
 
 remove_dot_docker_dir=false
 if [[ ! -d "${HOME}/.docker" ]]; then
-	mkdir "${HOME}"/.docker
+	# Tolerate the dir being created by a parallel job between the check
+	# above and this mkdir.
+	mkdir -p "${HOME}"/.docker
 	remove_dot_docker_dir=true
 fi
 
@@ -117,6 +121,7 @@ RUNTIME_CHOICE="${RUNTIME_CHOICE:-both}"
 IMAGE_SIZE_ALIGNMENT_MB=${IMAGE_SIZE_ALIGNMENT_MB:-}
 KERNEL_DEBUG_ENABLED="${KERNEL_DEBUG_ENABLED:-}"
 INIT_DATA="${INIT_DATA:-yes}"
+USE_DEVMAPPER="${USE_DEVMAPPER:-no}"
 
 docker run \
 	-v "${HOME}"/.docker:/root/.docker \
@@ -155,12 +160,15 @@ docker run \
 	--env REPO_URL_X86_64="${REPO_URL_X86_64}" \
 	--env REPO_COMPONENTS="${REPO_COMPONENTS}" \
 	--env AGENT_POLICY="${AGENT_POLICY}" \
+	--env USE_DEVMAPPER="${USE_DEVMAPPER}" \
 	--env RUNTIME_CHOICE="${RUNTIME_CHOICE}" \
+	--env STATIC_RUNTIME="${STATIC_RUNTIME:-}" \
 	--env IMAGE_SIZE_ALIGNMENT_MB="${IMAGE_SIZE_ALIGNMENT_MB}" \
 	--env KERNEL_DEBUG_ENABLED="${KERNEL_DEBUG_ENABLED}" \
 	--env AA_KBC="${AA_KBC:-}" \
 	--env HKD_PATH="$(realpath "${HKD_PATH:-}" 2> /dev/null || true)" \
 	--env SE_KERNEL_PARAMS="${SE_KERNEL_PARAMS:-}" \
+	--env FAKE_SE_IMAGE="${FAKE_SE_IMAGE:-}" \
 	--env CROSS_BUILD="${CROSS_BUILD}" \
 	--env TARGET_ARCH="${TARGET_ARCH}" \
 	--env ARCH="${ARCH}" \

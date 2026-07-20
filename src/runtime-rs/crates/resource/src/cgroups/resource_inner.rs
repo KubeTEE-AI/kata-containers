@@ -5,17 +5,20 @@
 //
 
 use std::collections::{HashMap, HashSet};
+use std::error::Error as _;
 use std::process;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use cgroups_rs::manager::is_systemd_cgroup;
-use cgroups_rs::{CgroupPid, FsManager, Manager, SystemdManager};
+use cgroups::manager::is_systemd_cgroup;
+use cgroups::{CgroupPid, FsManager, Manager, SystemdManager};
 use hypervisor::{Hypervisor, VcpuThreadIds};
 use kata_types::cpu::CpuSet;
 use nix::sched::{sched_setaffinity, CpuSet as NixCpuSet};
 use nix::unistd::Pid;
 use oci_spec::runtime::{LinuxCpu, LinuxCpuBuilder, LinuxResources, LinuxResourcesBuilder};
+use tokio::time::sleep;
 
 use crate::cgroups::utils::get_tgid_from_pid;
 use crate::cgroups::CgroupConfig;
@@ -39,6 +42,36 @@ pub(crate) struct CgroupsResourceInner {
 }
 
 impl CgroupsResourceInner {
+    fn is_already_exists_error(err: &cgroups::manager::Error) -> bool {
+        let mut source = err.source();
+
+        while let Some(inner_err) = source {
+            if let Some(io_err) = inner_err.downcast_ref::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::AlreadyExists {
+                    return true;
+                }
+            }
+
+            source = inner_err.source();
+        }
+
+        false
+    }
+
+    fn add_proc_with_existing_retry(
+        cgroup: &mut CgroupManager,
+        pid: CgroupPid,
+        context: &str,
+    ) -> Result<()> {
+        match cgroup.add_proc(pid) {
+            Ok(_) => Ok(()),
+            Err(err) if Self::is_already_exists_error(&err) => cgroup
+                .add_proc(pid)
+                .with_context(|| format!("{context} (retry after pre-existing cgroup)")),
+            Err(err) => Err(err).context(context.to_string()),
+        }
+    }
+
     /// Create cgroup managers according to the cgroup configuration.
     ///
     /// # Returns
@@ -88,13 +121,17 @@ impl CgroupsResourceInner {
         // The runtime is prioritized to be added to the overhead cgroup.
         let pid = CgroupPid::from(process::id() as u64);
         if let Some(overhead_cgroup) = overhead_cgroup.as_mut() {
-            overhead_cgroup
-                .add_proc(pid)
-                .context("add runtime to overhead cgroup")?;
+            Self::add_proc_with_existing_retry(
+                overhead_cgroup,
+                pid,
+                "add runtime to overhead cgroup",
+            )?;
         } else {
-            sandbox_cgroup
-                .add_proc(pid)
-                .context("add runtime to sandbox cgroup")?;
+            Self::add_proc_with_existing_retry(
+                &mut sandbox_cgroup,
+                pid,
+                "add runtime to sandbox cgroup",
+            )?;
         }
 
         Ok(Self {
@@ -187,12 +224,51 @@ impl CgroupsResourceInner {
         let needs_thread_ids = self.overhead_cgroup.is_some() || self.enable_vcpus_pinning;
 
         let thread_ids = if needs_thread_ids {
-            Some(
-                hypervisor
-                    .get_thread_ids()
-                    .await
-                    .context("get vCPU thread IDs")?,
-            )
+            let mut tids = hypervisor
+                .get_thread_ids()
+                .await
+                .context("get vCPU thread IDs")?;
+
+            // QEMU may not have spawned all vCPU threads yet. Retry with
+            // exponential backoff until we see the expected count.
+            let expected = hypervisor
+                .hypervisor_config()
+                .await
+                .cpu_info
+                .default_vcpus
+                .ceil() as usize;
+            if expected > 0 && tids.vcpus.len() < expected {
+                const MAX_ATTEMPTS: u32 = 10;
+                let mut backoff = Duration::from_millis(50);
+                for attempt in 2..=MAX_ATTEMPTS {
+                    if tids.vcpus.len() >= expected {
+                        break;
+                    }
+                    info!(
+                        sl!(),
+                        "waiting for all vCPU threads: have {}, want {}, attempt {}",
+                        tids.vcpus.len(),
+                        expected,
+                        attempt
+                    );
+                    sleep(backoff).await;
+                    backoff *= 2;
+                    tids = hypervisor
+                        .get_thread_ids()
+                        .await
+                        .context("get vCPU thread IDs (retry)")?;
+                }
+                if tids.vcpus.len() < expected {
+                    warn!(
+                        sl!(),
+                        "not all vCPU threads available after retries: have {}, want {}; pinning available ones",
+                        tids.vcpus.len(),
+                        expected
+                    );
+                }
+            }
+
+            Some(tids)
         } else {
             None
         };

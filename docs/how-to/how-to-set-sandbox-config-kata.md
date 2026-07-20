@@ -79,13 +79,13 @@ Warning: do not enable `virtio_fs_extra_args` in `enable_annotations` unless you
 | `io.katacontainers.config.hypervisor.vhost_user_reconnect_timeout_sec` | `string`| the timeout for reconnecting vhost user socket (QEMU)
 | `io.katacontainers.config.hypervisor.enable_virtio_mem` | `boolean` | enable virtio-mem (QEMU) |
 | `io.katacontainers.config.hypervisor.entropy_source` (R) | string| the path to a host source of entropy (`/dev/random`, `/dev/urandom` or real hardware RNG device) |
-| `io.katacontainers.config.hypervisor.file_mem_backend` (R) | string | file based memory backend root directory |
 | `io.katacontainers.config.hypervisor.firmware_hash` | string | container firmware SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.firmware` | string | the guest firmware that will run the container VM |
 | `io.katacontainers.config.hypervisor.firmware_volume_hash` | string | container firmware volume SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.firmware_volume` | string | the guest firmware volume that will be passed to the container VM |
 | `io.katacontainers.config.hypervisor.guest_hook_path` | string | the path within the VM that will be used for drop in hooks |
-| `io.katacontainers.config.hypervisor.hotplug_vfio_on_root_bus` | `boolean` | indicate if devices need to be hotplugged on the root bus instead of a bridge|
+| `io.katacontainers.config.hypervisor.cold_plug_vfio` | string | VFIO cold-plug mode; valid values are `no-port`, `bridge-port` (Go runtime only), `root-port`, `switch-port` (Go runtime only) |
+| `io.katacontainers.config.hypervisor.hot_plug_vfio` | string | VFIO hot-plug mode (Go runtime only); valid values are `no-port`, `bridge-port`, `root-port`, `switch-port` |
 | `io.katacontainers.config.hypervisor.hypervisor_hash` | string | container hypervisor binary SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.image_hash` | string | container guest image SHA-512 hash value |
 | `io.katacontainers.config.hypervisor.image` | string | the guest image that will run in the container VM |
@@ -227,7 +227,6 @@ the configuration entry:
 | Key | Config file entry | Comments |
 |-------| ----- | ----- |
 | `entropy_source` | `valid_entropy_sources` | Valid entropy sources, e.g. `/dev/random` |
-| `file_mem_backend`  | `valid_file_mem_backends` | Valid locations for the file-based memory backend root directory |
 | `jailer_path`  | `valid_jailer_paths`| Valid paths for the jailer constraining the container VM (Firecracker) |
 | `path`  | `valid_hypervisor_paths` | Valid hypervisors to run the container VM |
 | `vhost_user_store_path`  | `valid_vhost_user_store_paths` | Valid paths for vhost-user related files|

@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
+#[cfg(target_arch = "x86_64")]
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -22,6 +24,8 @@ use seccompiler::BpfProgram;
 use seccompiler::{apply_filter_all_threads, Error as SecError};
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
+#[cfg(target_arch = "x86_64")]
+use tdx::launch::*;
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -34,7 +38,6 @@ use crate::address_space_manager::{
     AddressManagerError, AddressSpaceMgr, AddressSpaceMgrBuilder, GuestAddressSpaceImpl,
     GuestMemoryImpl,
 };
-#[cfg(target_arch = "x86_64")]
 use crate::api::v1::ConfidentialVmType;
 use crate::api::v1::{InstanceInfo, InstanceState};
 use crate::device_manager::console_manager::DmesgWriter;
@@ -215,6 +218,11 @@ pub struct Vm {
     upcall_client: Option<Arc<UpcallClient<DevMgrService>>>,
 
     firmware_type: Option<FirmwareType>,
+
+    #[cfg(target_arch = "x86_64")]
+    tdx_launcher: Option<Launcher>,
+    #[cfg(target_arch = "x86_64")]
+    tdx_capabilities: Option<TdxCapabilities>,
 }
 
 impl Vm {
@@ -227,6 +235,16 @@ impl Vm {
         let id = api_shared_info.read().unwrap().id.clone();
         let logger = slog_scope::logger().new(slog::o!("id" => id));
         let kvm = KvmContext::new(kvm_fd)?;
+        #[cfg(target_arch = "x86_64")]
+        let tdx_enabled =
+            api_shared_info.read().unwrap().confidential_vm_type == Some(ConfidentialVmType::TDX);
+        #[cfg(target_arch = "x86_64")]
+        let vm_fd = if tdx_enabled {
+            Arc::new(kvm.create_vm_with_type(KVM_X86_TDX_VM)?)
+        } else {
+            Arc::new(kvm.create_vm()?)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let vm_fd = Arc::new(kvm.create_vm()?);
         let resource_manager = Arc::new(ResourceManager::new(Some(kvm.max_memslots())));
         let device_manager = DeviceManager::new(
@@ -239,9 +257,7 @@ impl Vm {
         .map_err(Error::DeviceMgrError)?;
 
         #[cfg(target_arch = "x86_64")]
-        let firmware_type = if api_shared_info.read().unwrap().confidential_vm_type
-            == Some(ConfidentialVmType::TDX)
-        {
+        let firmware_type = if tdx_enabled {
             Some(FirmwareType::Tdshim)
         } else {
             None
@@ -249,6 +265,15 @@ impl Vm {
 
         #[cfg(not(target_arch = "x86_64"))]
         let firmware_type = None;
+
+        #[cfg(target_arch = "x86_64")]
+        let (tdx_launcher, tdx_capabilities) = if tdx_enabled {
+            let mut launcher = Launcher::new(vm_fd.as_raw_fd());
+            let capabilities = launcher.get_capabilities().map_err(Error::TdxError)?;
+            (Some(launcher), Some(capabilities))
+        } else {
+            (None, None)
+        };
 
         Ok(Vm {
             epoll_manager,
@@ -276,6 +301,11 @@ impl Vm {
             upcall_client: None,
 
             firmware_type,
+
+            #[cfg(target_arch = "x86_64")]
+            tdx_launcher,
+            #[cfg(target_arch = "x86_64")]
+            tdx_capabilities,
         })
     }
 
@@ -425,6 +455,15 @@ impl Vm {
         Err(StartMicroVmError::AddressManagerError(
             AddressManagerError::GuestMemoryNotInitialized,
         ))
+    }
+
+    /// Get confidential VM type for micro VM, if any
+    pub fn confidential_vm_type(&self) -> Option<ConfidentialVmType> {
+        self.shared_info
+            .read()
+            .unwrap()
+            .confidential_vm_type
+            .clone()
     }
 }
 
@@ -616,6 +655,8 @@ impl Vm {
             .map_err(StartMicroVmError::AddressManagerError)?;
         address_space_param.set_kvm_vm_fd(self.vm_fd.clone());
         address_space_param.toggle_use_firmware(self.firmware_type.is_some());
+        #[cfg(target_arch = "x86_64")]
+        address_space_param.toggle_kvm_mem_attr_private(self.kvm_mem_attr_private());
         self.address_space
             .create_address_space(&self.resource_manager, &numa_regions, address_space_param)
             .map_err(StartMicroVmError::AddressManagerError)?;
@@ -778,6 +819,11 @@ impl Vm {
             .ok_or(StartMicroVmError::AddressManagerError(
                 AddressManagerError::GuestMemoryNotInitialized,
             ))?;
+
+        #[cfg(target_arch = "x86_64")]
+        if self.confidential_vm_type() == Some(ConfidentialVmType::TDX) {
+            self.tdx_init_vm()?;
+        }
 
         self.init_vcpu_manager(
             vm_as.clone(),

@@ -29,6 +29,16 @@ build_secure_image() {
 	kernel_params="${1:-}"
 	install_src_dir="${2:-}"
 	install_dest_dir="${3:-}"
+
+	# Check if FAKE_SE_IMAGE mode is enabled
+	if [[ "${FAKE_SE_IMAGE:-}" == "true" ]]; then
+		echo "FAKE_SE_IMAGE mode enabled: Creating dummy kata-containers-se.img via touch command"
+		echo "FAKE_SE_IMAGE mode: Skipping kernel, initrd, parmfile, and host key document checks"
+		mkdir -p "${install_dest_dir}"
+		touch "${install_dest_dir}/kata-containers-se.img"
+		return 0
+	fi
+
 	key_verify_option="--no-verify" # no verification for CI testing purposes
 
 	if [[ -n "${SIGNING_KEY_CERT_PATH:-}" ]] && [[ -n "${INTERMEDIATE_CA_CERT_PATH:-}" ]] && [[ -n "${HOST_KEY_CRL_PATH:-}" ]]; then
@@ -121,6 +131,9 @@ function repack_secure_image() {
 	if [[ "${for_kbs}" == "true" ]]; then
 		# Rename kata-containers-se.img to hdr.bin and clean up kernel and initrd
 		mv "${build_dir}/hdr/kata-containers-se.img" "${build_dir}/hdr/hdr.bin"
+		# The Attestation Service reads hdr.bin as a non-root user via a group
+		# (fsGroup) mount, so make sure it is group/other readable.
+		chmod +r "${build_dir}/hdr/hdr.bin"
 		rm -f "${build_dir}"/hdr/{vmlinuz.container,kata-containers-initrd-confidential.img}
 	else
 		# Clean up the build directory completely

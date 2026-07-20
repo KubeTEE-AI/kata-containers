@@ -34,7 +34,7 @@ lazy_static = "1.2"
 libc = "0.2.39"
 linux-loader = { workspace = true }
 log = "0.4.14"
-nix = "0.24.2"
+nix = { workspace = true, features = ["mman"] }
 procfs = "0.12.0"
 prometheus = { version = "0.14.0", features = ["process"] }
 seccompiler = { workspace = true }
@@ -43,7 +43,7 @@ serde_derive = "1.0.27"
 serde_json = "1.0.9"
 slog = "2.5.2"
 slog-scope = "4.4.0"
-thiserror = "1"
+thiserror = { workspace = true }
 tracing = "0.1.41"
 vmm-sys-util = { workspace = true }
 virtio-queue = { workspace = true, optional = true }
@@ -52,6 +52,9 @@ crossbeam-channel = "0.5.6"
 vfio-bindings = { workspace = true, optional = true }
 vfio-ioctls = { workspace = true, optional = true }
 kata-sys-util = { path = "../libs/kata-sys-util" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+tdx = { workspace = true }
 
 [dev-dependencies]
 slog-async = "2.7.0"

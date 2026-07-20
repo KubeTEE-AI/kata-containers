@@ -72,13 +72,14 @@ if [[ -n "${K8S_TEST_NV:-}" ]]; then
 	mapfile -d " " -t K8S_TEST_NV <<< "${K8S_TEST_NV}"
 else
 	K8S_TEST_NV=("k8s-confidential-attestation.bats" \
+		"k8s-nvidia-numa.bats" \
 		"k8s-nvidia-cuda.bats" \
 		"k8s-nvidia-nim.bats" \
 		"k8s-nvidia-nim-service.bats")
 fi
 
 SUPPORTED_HYPERVISORS=("qemu-nvidia-gpu" "qemu-nvidia-gpu-snp" "qemu-nvidia-gpu-tdx" "qemu-nvidia-gpu-runtime-rs" "qemu-nvidia-gpu-snp-runtime-rs" "qemu-nvidia-gpu-tdx-runtime-rs")
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu-runtime-rs}"
 # shellcheck disable=SC2076 # intentionally use literal string matching
 if [[ ! " ${SUPPORTED_HYPERVISORS[*]} " =~ " ${KATA_HYPERVISOR} " ]]; then
 	die "Unsupported KATA_HYPERVISOR=${KATA_HYPERVISOR}. Must be one of: ${SUPPORTED_HYPERVISORS[*]}"

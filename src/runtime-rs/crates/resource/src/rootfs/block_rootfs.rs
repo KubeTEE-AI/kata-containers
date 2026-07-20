@@ -10,11 +10,9 @@ use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hypervisor::{
-    device::{
-        device_manager::{do_handle_device, get_block_device_info, DeviceManager},
-        DeviceConfig, DeviceType,
+    BlockConfigModern, BlockDeviceAio, device::{
+        DeviceConfig, DeviceType, device_manager::{DeviceManager, do_handle_device, get_block_device_info},
     },
-    BlockConfig, BlockDeviceAio,
 };
 use kata_types::config::hypervisor::{
     VIRTIO_BLK_CCW, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI, VIRTIO_PMEM, VIRTIO_SCSI,
@@ -52,17 +50,21 @@ impl BlockRootfs {
 
         let blkdev_info = get_block_device_info(d).await;
         let block_driver = blkdev_info.block_device_driver.clone();
-        let block_device_config = &mut BlockConfig {
+        let block_device_config = &mut BlockConfigModern {
             major: stat::major(dev_id) as i64,
             minor: stat::minor(dev_id) as i64,
             driver_option: block_driver.clone(),
             path_on_host: rootfs.source.clone(),
             blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
+            num_queues: blkdev_info.num_queues,
+            queue_size: blkdev_info.queue_size,
+            logical_sector_size: blkdev_info.block_device_logical_sector_size,
+            physical_sector_size: blkdev_info.block_device_physical_sector_size,
             ..Default::default()
         };
 
         // create and insert block device into Kata VM
-        let device_info = do_handle_device(d, &DeviceConfig::BlockCfg(block_device_config.clone()))
+        let device_info = do_handle_device(d, &DeviceConfig::BlockCfgModern(block_device_config.clone()))
             .await
             .context("do handle device failed.")?;
 
@@ -84,7 +86,8 @@ impl BlockRootfs {
         }
 
         let mut device_id: String = "".to_owned();
-        if let DeviceType::Block(device) = device_info {
+        if let DeviceType::BlockModern(device_mod) = device_info {
+            let device = device_mod.lock().await.clone();
             storage.driver = device.config.driver_option;
             device_id = device.device_id;
 
@@ -106,7 +109,13 @@ impl BlockRootfs {
                         .ccw_addr
                         .ok_or_else(|| anyhow!("CCW address missing for ccw block device"))?;
                 }
-                VIRTIO_SCSI | VIRTIO_PMEM => {
+                VIRTIO_SCSI => {
+                    storage.source = device
+                        .config
+                        .scsi_addr
+                        .ok_or_else(|| anyhow!("SCSI address missing for scsi block device"))?;
+                }
+                VIRTIO_PMEM => {
                     return Err(anyhow!(
                         "Complete support for block driver {} has not been implemented yet",
                         block_driver

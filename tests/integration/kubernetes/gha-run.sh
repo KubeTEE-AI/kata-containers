@@ -24,7 +24,7 @@ export DOCKER_REGISTRY="${DOCKER_REGISTRY:-quay.io}"
 export DOCKER_REPO="${DOCKER_REPO:-kata-containers/kata-deploy-ci}"
 export DOCKER_TAG="${DOCKER_TAG:-kata-containers-latest}"
 export SNAPSHOTTER_DEPLOY_WAIT_TIMEOUT="${SNAPSHOTTER_DEPLOY_WAIT_TIMEOUT:-8m}"
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 export CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"
 export KBS="${KBS:-false}"
 export KBS_INGRESS="${KBS_INGRESS:-}"
@@ -105,7 +105,7 @@ EOF
 		| .plugins["io.containerd.snapshotter.v1.devmapper"].base_image_size = "4096MB"
 		| .plugins["io.containerd.transfer.v1.local"].unpack_config =
 			[((.plugins["io.containerd.transfer.v1.local"].unpack_config[0] // {}) + {platform: $platform, snapshotter: "devmapper"})]
-		| if .version == 3 then
+		| if (.version // 0) >= 3 then
 			.plugins["io.containerd.cri.v1.images"].snapshotter = "devmapper"
 		  else
 			.plugins["io.containerd.grpc.v1.cri"].containerd.snapshotter = "devmapper"
@@ -169,6 +169,8 @@ function delete_coco_kbs() {
 # Environment variables:
 #	KBS_INGRESS - (optional) specify the ingress implementation to expose the
 #	              service externally
+#	NVIDIA_VERIFIER_MODE - (optional) remote (default) | local: overrides the
+#	                       NVIDIA verifier type for nvidia-gpu hypervisors.
 #
 function deploy_coco_kbs() {
 	kbs_k8s_deploy "${KBS_INGRESS}"
@@ -198,8 +200,12 @@ function deploy_kata() {
 		EXPERIMENTAL_FORCE_GUEST_PULL=false
 	fi
 
+	if [[ "${KATA_HYPERVISOR}" == "qemu-nvidia-cpu-runtime-rs" || "${KATA_HYPERVISOR}" == "qemu-nvidia-gpu-runtime-rs" ]] && [[ -z "${SNAPSHOTTER}" ]]; then
+		SNAPSHOTTER="erofs"
+	fi
+
 	ANNOTATIONS="default_vcpus"
-	if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
+	if [[ "${KATA_HYPERVISOR}" == *azure* ]]; then
 		ANNOTATIONS="image kernel default_vcpus cc_init_data"
 	fi
 	if [[ "${KATA_HYPERVISOR}" = "qemu" ]]; then
@@ -214,11 +220,6 @@ function deploy_kata() {
 	PULL_TYPE_MAPPING=""
 	if [[ "${PULL_TYPE}" != "default" ]]; then
 		PULL_TYPE_MAPPING="${KATA_HYPERVISOR}:${PULL_TYPE}"
-	fi
-
-	HOST_OS=""
-	if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
-		HOST_OS="${KATA_HOST_OS}"
 	fi
 
 	# nydus and erofs are always deployed by kata-deploy; set this unconditionally
@@ -246,7 +247,6 @@ function deploy_kata() {
 	export HELM_PULL_TYPE_MAPPING="${PULL_TYPE_MAPPING}"
 	export HELM_EXPERIMENTAL_SETUP_SNAPSHOTTER="${EXPERIMENTAL_SETUP_SNAPSHOTTER}"
 	export HELM_EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL}"
-	export HELM_HOST_OS="${HOST_OS}"
 	helm_helper
 }
 
@@ -286,8 +286,10 @@ function run_tests() {
 		# enabled. Therefore, use containerd's default settings instead of distro's defaults. Note that
 		# the k8s test cluster nodes have their own containerd settings (created by kata-deploy),
 		# independent from the local settings being created here.
-		sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+		PATH="${PATH}:/usr/local/bin:/usr/local/sbin" containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
 		echo "containerd config has been set to default"
+		ensure_containerd_conf_d_rootful_api_sockets
+		require_containerd_config_schema_v3_plus
 		sudo systemctl restart containerd && sudo systemctl is-active containerd
 
 		# Allow genpolicy to access the containerd image pull APIs without sudo.
@@ -316,7 +318,7 @@ function run_tests() {
 		echo "start_time=${start_time}" >> "${GITHUB_ENV}"
 	fi
 
-	if [[ "${KATA_HYPERVISOR}" = "clh-runtime-rs" ]] && [[ "${SNAPSHOTTER}" = "devmapper" ]]; then
+	if [[ "${KATA_HYPERVISOR}" =~ ^clh(-azure)?-runtime-rs$ ]] && [[ "${SNAPSHOTTER}" = "devmapper" ]]; then
 		if [[ -n "${GITHUB_ENV}" ]]; then
 			KATA_TEST_VERBOSE=true
 			export KATA_TEST_VERBOSE
@@ -475,7 +477,7 @@ function main() {
 		        ( "${TARGET_ARCH}" = "x86_64" || "${TARGET_ARCH}" = "aarch64" ) && \
 		        "${PULL_TYPE}" != "experimental-force-guest-pull" ]]; then
 			AUTO_GENERATE_POLICY="yes"
-		elif [[ "${KATA_HYPERVISOR}" = qemu-nvidia-gpu-* ]]; then
+		elif is_confidential_gpu_hypervisor "${KATA_HYPERVISOR}"; then
 			AUTO_GENERATE_POLICY="yes"
 		fi
 	fi
