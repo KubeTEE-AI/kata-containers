@@ -18,10 +18,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix8: stop_vm uses start_kill (not kill().await) + wait_vm outside qemu_process
-  # mutex / inner.write — fixes zombie QEMU + stuck Terminating pods when containerd
-  # SIGKILLs the shim during multi-minute TDX teardown (kata#13564). Includes fix7.
-  SHIM_TAG: v4.0.0-nvswitch-fix8
+  # fix9: PR_SET_PDEATHSIG on QEMU + stop_vm/sandbox.stop do not await multi-minute
+  # reclaim — fix8 still left live orphan QEMU when containerd SIGKILLed shim mid-wait.
+  # Includes fix7/fix8.
+  SHIM_TAG: v4.0.0-nvswitch-fix9
 
 jobs:
   build-and-push:
@@ -59,6 +59,10 @@ jobs:
           echo "Checking for fix8 start_kill / wait outside lock"
           grep -n 'start_kill' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
           grep -n 'qemu_pid' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
+          echo "Checking for fix9 PDEATHSIG + non-blocking stop"
+          grep -n 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -3
+          grep -n 'background wait_vm after stop_vm' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs | head -3
+          grep -n 'not waiting for qemu exit' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
           git log --oneline -1
 
       - name: Generate config.rs
