@@ -9,6 +9,8 @@ on:
       - 'src/runtime-rs/crates/hypervisor/src/device/driver/vfio_device/core.rs'
       - 'src/runtime-rs/crates/hypervisor/src/qemu/inner.rs'
       - 'src/runtime-rs/crates/hypervisor/src/qemu/mod.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs'
       - 'src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs'
       - 'src/runtime-rs/crates/resource/src/network/**'
       - 'src/runtime-rs/crates/resource/src/manager.rs'
@@ -18,10 +20,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix10: stop_vm/wait_vm take Child and reap on OS thread (try_wait) so a
-  # cancelled tokio waiter cannot leave zombie QEMU under an orphaned shim.
-  # Includes fix7/fix8/fix9 (PDEATHSIG + non-blocking Shutdown).
-  SHIM_TAG: v4.0.0-nvswitch-fix10
+  # fix11: timed QMP connect + Child try_wait + drop parent listen FD +
+  # OS-thread reap on start_vm failure (fixes unbounded connect hang / Z QEMU
+  # when QMP never comes up — glm-0 B200). Includes fix10 OS reaper.
+  SHIM_TAG: v4.0.0-nvswitch-fix11
 
 jobs:
   build-and-push:
@@ -64,6 +66,8 @@ jobs:
           grep -n 'not waiting for qemu exit' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
           echo "Checking for fix10 OS-thread reaper"
           grep -n 'spawn_os_reaper\|fix10 OS reaper\|take_qemu_child' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -10
+          echo "Checking for fix11 timed QMP connect / drop listen FD"
+          grep -n 'connect_unix_timeout\|drop_qmp_listen_fd\|kill_and_os_reap_qemu\|Qmp::connect'             src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs             src/runtime-rs/crates/hypervisor/src/qemu/inner.rs             src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs | head -15
           git log --oneline -1
 
       - name: Generate config.rs
