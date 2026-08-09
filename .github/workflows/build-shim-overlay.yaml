@@ -18,10 +18,10 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix9: PR_SET_PDEATHSIG on QEMU + stop_vm/sandbox.stop do not await multi-minute
-  # reclaim — fix8 still left live orphan QEMU when containerd SIGKILLed shim mid-wait.
-  # Includes fix7/fix8.
-  SHIM_TAG: v4.0.0-nvswitch-fix9
+  # fix10: stop_vm/wait_vm take Child and reap on OS thread (try_wait) so a
+  # cancelled tokio waiter cannot leave zombie QEMU under an orphaned shim.
+  # Includes fix7/fix8/fix9 (PDEATHSIG + non-blocking Shutdown).
+  SHIM_TAG: v4.0.0-nvswitch-fix10
 
 jobs:
   build-and-push:
@@ -61,8 +61,9 @@ jobs:
           grep -n 'qemu_pid' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
           echo "Checking for fix9 PDEATHSIG + non-blocking stop"
           grep -n 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -3
-          grep -n 'background wait_vm after stop_vm' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs | head -3
           grep -n 'not waiting for qemu exit' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
+          echo "Checking for fix10 OS-thread reaper"
+          grep -n 'spawn_os_reaper\|fix10 OS reaper\|take_qemu_child' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -10
           git log --oneline -1
 
       - name: Generate config.rs
