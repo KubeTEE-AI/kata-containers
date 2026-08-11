@@ -15,15 +15,17 @@ on:
       - 'src/runtime-rs/crates/resource/src/network/**'
       - 'src/runtime-rs/crates/resource/src/manager.rs'
       - 'src/runtime-rs/crates/resource/src/manager_inner.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/lib.rs'
+      - 'tools/kubetee-shim-overlay/**'
       - '.github/workflows/build-shim-overlay.yaml'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix11: timed QMP connect + Child try_wait + drop parent listen FD +
-  # OS-thread reap on start_vm failure (fixes unbounded connect hang / Z QEMU
-  # when QMP never comes up — glm-0 B200). Includes fix10 OS reaper.
-  SHIM_TAG: v4.0.0-nvswitch-fix11
+  # fix12: start-fail bounded QEMU reap + hardened tap EBUSY reuse +
+  # host orphan-reaper for PPID=1 shims (TUNSETIFF EBUSY after abandon).
+  # Includes fix11 timed QMP / fix10 OS reaper / fix7 start_mutex.
+  SHIM_TAG: v4.0.0-nvswitch-fix12
 
 jobs:
   build-and-push:
@@ -68,6 +70,11 @@ jobs:
           grep -n 'spawn_os_reaper\|fix10 OS reaper\|take_qemu_child' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -10
           echo "Checking for fix11 timed QMP connect / drop listen FD"
           grep -n 'connect_unix_timeout\|drop_qmp_listen_fd\|kill_and_os_reap_qemu\|Qmp::connect'             src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs             src/runtime-rs/crates/hypervisor/src/qemu/inner.rs             src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs | head -15
+          echo "Checking for fix12 start-fail bounded reap + tap held messaging"
+          grep -n 'stop_vm_for_start_fail\|fix12' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/lib.rs | head -10
+          grep -n 'stop_vm_for_start_fail\|START_FAIL_REAP' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
+          grep -n 'held by live process\|nix::errno::Errno' src/runtime-rs/crates/resource/src/network/network_pair.rs src/runtime-rs/crates/resource/src/network/utils/link/create.rs | head -10
+          grep -n 'orphan-reaper\|ORPHAN_GRACE' tools/kubetee-shim-overlay/overlay.sh | head -5
           git log --oneline -1
 
       - name: Generate config.rs
@@ -100,10 +107,8 @@ jobs:
         run: |
           mkdir -p overlay-image
           cp src/runtime-rs/containerd-shim-kata-v2 overlay-image/
-
-          printf '#!/bin/sh\nset -eu\nSRC=/opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nDST=/host/opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nMARK=/host/opt/kata/runtime-rs/bin/.nvswitch-fix-applied\necho "[overlay] waiting for kata-deploy to install $DST ..."\nwhile [ ! -f "$DST" ]; do sleep 5; done\necho "[overlay] $DST present"\napply() {\n  if cmp -s "$SRC" "$DST"; then\n    echo "[overlay] shim already patched (no-op)"\n  else\n    cp "$SRC" "$DST"\n    chmod 755 "$DST"\n    sha256sum "$SRC" | cut -d" " -f1 > "$MARK"\n    echo "[overlay] patched shim applied: $(cut -c1-16 < "$MARK")"\n  fi\n}\napply\necho "[overlay] entering watch loop"\nwhile true; do sleep 60; apply; done\n' > overlay-image/overlay.sh
+          cp tools/kubetee-shim-overlay/overlay.sh overlay-image/overlay.sh
           chmod 755 overlay-image/overlay.sh
-
           printf 'FROM alpine:3.22\nCOPY containerd-shim-kata-v2 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
 
       - name: Log in to GHCR
@@ -123,3 +128,4 @@ jobs:
       - name: Verify image
         run: |
           docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} sha256sum /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 || true
+          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} grep -n orphan-reaper /overlay.sh | head -5
