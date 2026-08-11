@@ -124,6 +124,28 @@ reap_orphans() {
     done
     echo "[orphan-reaper] killed shim pid=$pid id=${sid:-unknown}"
   done
+
+  # Second pass: QEMU already reparented to init (shim gone, PDEATHSIG missed
+  # or reclaim stuck). Age-gated; never touch QEMU whose PPID is a live shim.
+  for status in "$HOST_PROC"/[0-9]*/status; do
+    [ -f "$status" ] || continue
+    pid=$(basename "$(dirname "$status")")
+    ppid=$(awk '/^PPid:/{print $2; exit}' "$status" 2>/dev/null || true)
+    [ "$ppid" = "1" ] || continue
+    cmd=$(tr '\0' ' ' < "$HOST_PROC/$pid/cmdline" 2>/dev/null || true)
+    # Also match bracketed kernel comm after SIGKILL mid-reclaim: [qemu-system-x86]
+    comm=$(awk '/^Name:/{print $2; exit}' "$status" 2>/dev/null || true)
+    echo "$cmd $comm" | grep -q 'qemu-system' || continue
+    age=$(proc_age_secs "$pid")
+    if [ "$age" -lt "$ORPHAN_GRACE_SECS" ]; then
+      continue
+    fi
+    echo "[orphan-reaper] killing orphan QEMU pid=$pid age=${age}s ppid=1"
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+    kill -9 "$pid" 2>/dev/null || true
+    echo "[orphan-reaper] killed QEMU pid=$pid"
+  done
 }
 
 apply
