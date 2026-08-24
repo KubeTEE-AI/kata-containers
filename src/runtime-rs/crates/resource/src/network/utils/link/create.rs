@@ -16,6 +16,45 @@ use nix::ioctl_write_ptr;
 
 use super::macros::{get_name, set_name};
 
+/// True when TUNSETIFF failed because the named device already exists / is busy.
+/// Used to reuse a leftover `tapN_kata` after a failed sandbox start (IFF_PERSIST
+/// keeps the device alive after the creating FDs are dropped).
+///
+/// fix12: match every error-shape we have seen on musl/glibc (io::Error,
+/// nix::Error / Errno, and Display text) so reuse cannot miss EBUSY.
+pub fn is_busy_or_exist(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(ioe) = cause.downcast_ref::<io::Error>() {
+            match ioe.raw_os_error() {
+                Some(libc::EBUSY) | Some(libc::EEXIST) => return true,
+                _ => {}
+            }
+            if ioe.kind() == io::ErrorKind::AlreadyExists
+                || ioe.kind() == io::ErrorKind::ResourceBusy
+            {
+                return true;
+            }
+        }
+        if let Some(ne) = cause.downcast_ref::<nix::Error>() {
+            if *ne == nix::Error::EBUSY || *ne == nix::Error::EEXIST {
+                return true;
+            }
+        }
+        // nix >= 0.27 often surfaces Errno directly in the chain.
+        if let Some(errno) = cause.downcast_ref::<nix::errno::Errno>() {
+            if *errno == nix::errno::Errno::EBUSY || *errno == nix::errno::Errno::EEXIST {
+                return true;
+            }
+        }
+    }
+    let s = format!("{err:#}");
+    s.contains("EBUSY")
+        || s.contains("EEXIST")
+        || s.contains("Device or resource busy")
+        || s.contains("File exists")
+        || s.contains("Resource busy")
+}
+
 type IfName = [u8; libc::IFNAMSIZ];
 
 #[derive(Copy, Clone, Debug)]
@@ -123,32 +162,68 @@ fn create_queue(name: &str, flags: libc::c_int) -> Result<(File, String)> {
     let mut req = CreateLinkReq::from_name(name)?;
     unsafe {
         req.set_raw_flags(flags as libc::c_short);
-        tun_set_iff(file.as_raw_fd(), &mut req as *mut _ as *mut _).context("tun set iff")?;
+        if let Err(e) = tun_set_iff(file.as_raw_fd(), &mut req as *mut _ as *mut _) {
+            // #region agent log
+            let wrapped = anyhow::Error::from(e).context("tun set iff");
+            let causes: Vec<String> = wrapped.chain().map(|c| format!("{c:?}")).collect();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let payload = serde_json::json!({
+                "sessionId": "b73125",
+                "hypothesisId": "H3",
+                "location": "create.rs:create_queue",
+                "message": "TUNSETIFF failed",
+                "data": {
+                    "name": name,
+                    "is_busy_or_exist": is_busy_or_exist(&wrapped),
+                    "causes": causes,
+                    "display": format!("{wrapped:#}"),
+                },
+                "timestamp": ts,
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/debug-b73125.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", payload);
+            }
+            info!(sl!(), "DEBUG_B73125 {}", payload);
+            return Err(wrapped);
+            // #endregion
+        }
     };
     Ok((file, req.get_name()?))
 }
 
-#[cfg(test)]
-pub mod net_test_utils {
+/// Delete a link by name (e.g. leftover `tap0_kata` after a failed start).
+pub async fn delete_link(handle: &rtnetlink::Handle, name: &str) -> Result<()> {
     use crate::network::network_model::tc_filter_model::fetch_index;
 
-    // remove a link by its name
-    #[allow(dead_code)]
-    pub async fn delete_link(
-        handle: &rtnetlink::Handle,
-        name: &str,
-    ) -> Result<(), rtnetlink::Error> {
-        let link_index = fetch_index(handle, name)
-            .await
-            .expect("failed to fetch index");
-        // the ifindex of a link will not change during its lifetime, so the index
-        // remains the same between the query above and the deletion below
-        handle.link().del(link_index).execute().await
-    }
+    let link_index = fetch_index(handle, name)
+        .await
+        .with_context(|| format!("fetch index for {name}"))?;
+    handle
+        .link()
+        .del(link_index)
+        .execute()
+        .await
+        .with_context(|| format!("delete link {name}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub mod net_test_utils {
+    // Back-compat for tests that imported delete_link from this module.
+    pub use super::delete_link;
 }
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use scopeguard::defer;
     use test_utils::skip_if_not_root;
 
@@ -157,6 +232,27 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_is_busy_or_exist_shapes() {
+        let io_busy = anyhow!(io::Error::from_raw_os_error(libc::EBUSY)).context("tun set iff");
+        assert!(is_busy_or_exist(&io_busy));
+
+        let io_exist = anyhow!(io::Error::from_raw_os_error(libc::EEXIST)).context("tun set iff");
+        assert!(is_busy_or_exist(&io_exist));
+
+        let nix_busy = anyhow!(nix::Error::EBUSY).context("tun set iff");
+        assert!(is_busy_or_exist(&nix_busy));
+
+        let errno_busy = anyhow!(nix::errno::Errno::EBUSY).context("tun set iff");
+        assert!(is_busy_or_exist(&errno_busy));
+
+        let text = anyhow!("EBUSY: Device or resource busy");
+        assert!(is_busy_or_exist(&text));
+
+        let other = anyhow!(io::Error::from_raw_os_error(libc::EINVAL)).context("tun set iff");
+        assert!(!is_busy_or_exist(&other));
+    }
 
     #[actix_rt::test]
     async fn test_create_link() {
