@@ -24,22 +24,178 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
 use std::io::BufReader;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::str::FromStr;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use qapi_spec::Dictionary;
-use std::thread;
-use std::time::Instant;
+use tokio::process::Child;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+
+use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::sys::socket::sockopt::SocketError;
+use nix::sys::socket::{
+    connect, getsockopt, socket, AddressFamily, SockFlag, SockType, UnixAddr,
+};
 
 /// default qmp connection read timeout
 const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
 const DEFAULT_QMP_INIT_READ_TIMEOUT: u64 = 5000;
-const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
+/// blockdev-add of a multi-layer EROFS VMDK can exceed 250ms. SO_RCVTIMEO then
+/// returns EAGAIN (WouldBlock) after QEMU has already created the node, and the
+/// CreateContainer retry hits "Duplicate nodes drive-N" (kata#11649 / fix15).
+const DEFAULT_QMP_HOTPLUG_READ_TIMEOUT: u64 = 60_000;
+/// Overall QMP bring-up ceiling (historical). Per-attempt connect is bounded
+/// separately by DEFAULT_QMP_CONNECT_ATTEMPT_MS (fix11).
+pub const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
 const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
+/// fix11: never block forever in connect(2). Parent holding the QMP listen FD
+/// after a dead QEMU made unbounded UnixStream::connect hang (glm-0 B200).
+const DEFAULT_QMP_CONNECT_ATTEMPT_MS: u64 = 1000;
 
 const DEVICE_DELETED_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Non-blocking AF_UNIX connect with a hard timeout (fix11).
+fn connect_unix_timeout(path: &str, timeout: Duration) -> std::io::Result<UnixStream> {
+    let addr = UnixAddr::new(path).map_err(std::io::Error::from)?;
+    let sock: OwnedFd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .map_err(std::io::Error::from)?;
+
+    match connect(sock.as_raw_fd(), &addr) {
+        Ok(()) => {}
+        Err(Errno::EINPROGRESS) => {
+            let mut pfd = libc::pollfd {
+                fd: sock.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "qmp unix connect timed out",
+                ));
+            }
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let err = getsockopt(&sock, SocketError).map_err(std::io::Error::from)?;
+            if err != 0 {
+                return Err(std::io::Error::from_raw_os_error(err));
+            }
+        }
+        Err(e) => return Err(std::io::Error::from(e)),
+    }
+
+    // qapi expects a blocking stream for handshake / execute.
+    let flags = fcntl(&sock, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    let flags = OFlag::from_bits_truncate(flags) & !OFlag::O_NONBLOCK;
+    fcntl(&sock, FcntlArg::F_SETFL(flags)).map_err(std::io::Error::from)?;
+
+    Ok(unsafe { UnixStream::from_raw_fd(sock.into_raw_fd()) })
+}
+
+pub(crate) fn debug_b73125(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    // #region agent log
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "sessionId": "b73125",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": ts,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/run/debug-b73125.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", payload);
+    }
+    info!(sl!(), "DEBUG_B73125 {}", payload);
+    // #endregion
+}
+
+fn qemu_sample(pid: Option<u32>) -> serde_json::Value {
+    let Some(pid) = pid else {
+        return serde_json::json!({"pid": null});
+    };
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap_or_default();
+    let mut state = String::new();
+    let mut vmrss = String::new();
+    let mut nthreads = String::new();
+    for line in status.lines() {
+        if line.starts_with("State:") {
+            state = line.trim().to_string();
+        } else if line.starts_with("VmRSS:") {
+            vmrss = line.trim().to_string();
+        } else if line.starts_with("Threads:") {
+            nthreads = line.trim().to_string();
+        }
+    }
+    let mut tasks = Vec::new();
+    if let Ok(dir) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
+        for ent in dir.flatten() {
+            let tid = ent.file_name().to_string_lossy().to_string();
+            let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, tid))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let stack: Vec<String> = std::fs::read_to_string(format!("/proc/{}/task/{}/stack", pid, tid))
+                .unwrap_or_default()
+                .lines()
+                .take(8)
+                .map(|l| l.to_string())
+                .collect();
+            let cpu = std::fs::read_to_string(format!("/proc/{}/task/{}/stat", pid, tid))
+                .ok()
+                .and_then(|raw| {
+                    let rest = raw.rsplit_once(')')?.1.split_whitespace().nth(36)?;
+                    rest.parse::<i32>().ok()
+                });
+            tasks.push(serde_json::json!({"tid": tid, "wchan": wchan, "cpu": cpu, "stack": stack}));
+        }
+    }
+    // #region agent log
+    let leftover_kvm = std::fs::read_dir("/sys/kernel/debug/kvm")
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    // #endregion
+    serde_json::json!({
+        "pid": pid,
+        "state": state,
+        "wchan": std::fs::read_to_string(format!("/proc/{}/wchan", pid)).unwrap_or_default().trim().to_string(),
+        "vmrss": vmrss,
+        "threads": nthreads,
+        "tasks": tasks,
+        "leftover_kvm": leftover_kvm,
+    })
+}
 
 pub struct Qmp {
     qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
@@ -76,9 +232,24 @@ impl Debug for Qmp {
 }
 
 impl Qmp {
-    pub fn new(qmp_sock_path: &str) -> Result<Self> {
+    /// Connect to QEMU's QMP socket with bounded connect(2) and Child liveness
+    /// checks (fix11 / kata-containers#13564).
+    ///
+    /// Previously this used unbounded `UnixStream::connect` on a path whose
+    /// listen FD was still held by the parent after spawn. When QEMU died
+    /// before speaking QMP, connect could block forever — the 50s deadline
+    /// never fired, Err-path cleanup never ran, and QEMU stayed Z under the
+    /// shim (glm-0 on B200).
+    pub async fn connect(
+        qmp_sock_path: &str,
+        qemu_process: &Mutex<Option<Child>>,
+        overall_timeout: Duration,
+    ) -> Result<Self> {
         let try_new_once_fn = || -> Result<Qmp> {
-            let stream = UnixStream::connect(qmp_sock_path)?;
+            let stream = connect_unix_timeout(
+                qmp_sock_path,
+                Duration::from_millis(DEFAULT_QMP_CONNECT_ATTEMPT_MS),
+            )?;
 
             stream
                 .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_INIT_READ_TIMEOUT)))
@@ -100,19 +271,132 @@ impl Qmp {
             Ok(qmp)
         };
 
-        let deadline = Instant::now() + Duration::from_millis(DEFAULT_QMP_CONNECT_DEADLINE_MS);
+        let deadline = Instant::now() + overall_timeout;
         let mut last_err: Option<anyhow::Error> = None;
+        let started = Instant::now();
+        let mut attempts: u32 = 0;
+        let qemu_pid = {
+            let mut guard = qemu_process.lock().await;
+            guard.as_mut().and_then(|c| c.id())
+        };
+        // #region agent log
+        debug_b73125(
+            "H11",
+            "qmp.rs:connect:entry",
+            "QMP connect start",
+            serde_json::json!({
+                "sock": qmp_sock_path,
+                "sock_exists": std::path::Path::new(qmp_sock_path).exists(),
+                "deadline_ms": overall_timeout.as_millis() as u64,
+                "sample": qemu_sample(qemu_pid),
+            }),
+        );
+        let sample_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sample_stop_t = sample_stop.clone();
+        let sample_started = started;
+        let sampler = std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !sample_stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                if sample_stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                n += 1;
+                debug_b73125(
+                    "H11",
+                    "qmp.rs:connect:sample",
+                    "still waiting for QMP",
+                    serde_json::json!({
+                        "n": n,
+                        "elapsed_ms": sample_started.elapsed().as_millis() as u64,
+                        "sample": qemu_sample(qemu_pid),
+                    }),
+                );
+            }
+        });
+        // #endregion
 
         while Instant::now() < deadline {
+            // Fail fast if QEMU already exited (try_wait reaps a zombie Child).
+            {
+                let mut guard = qemu_process.lock().await;
+                match guard.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => {
+                            sample_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = sampler.join();
+                            // #region agent log
+                            debug_b73125(
+                                "H12",
+                                "qmp.rs:connect:qemu_exited",
+                                "QEMU exited before QMP ready",
+                                serde_json::json!({
+                                    "status": format!("{:?}", status),
+                                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                                }),
+                            );
+                            // #endregion
+                            return Err(anyhow!(
+                                "QEMU exited before QMP ready (status={:?})",
+                                status
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            sample_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = sampler.join();
+                            return Err(anyhow!("QEMU try_wait during QMP connect: {}", e));
+                        }
+                    },
+                    None => {
+                        sample_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = sampler.join();
+                        return Err(anyhow!("QEMU Child missing before QMP ready"));
+                    }
+                }
+            }
+
+            attempts += 1;
             match try_new_once_fn() {
-                Ok(qmp) => return Ok(qmp),
+                Ok(qmp) => {
+                    sample_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = sampler.join();
+                    // #region agent log
+                    debug_b73125(
+                        "H11",
+                        "qmp.rs:connect:ok",
+                        "QMP ready",
+                        serde_json::json!({
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "attempts": attempts,
+                            "sample": qemu_sample(qemu_pid),
+                        }),
+                    );
+                    // #endregion
+                    return Ok(qmp);
+                }
                 Err(e) => {
                     debug!(sl!(), "QMP not ready yet: {}", e);
+                    // #region agent log
+                    debug_b73125(
+                        "H11",
+                        "qmp.rs:connect:attempt_err",
+                        "handshake/connect attempt failed",
+                        serde_json::json!({
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "attempts": attempts,
+                            "err": format!("{:#}", e),
+                            "sample": qemu_sample(qemu_pid),
+                        }),
+                    );
+                    // #endregion
                     last_err = Some(e);
-                    thread::sleep(Duration::from_millis(DEFAULT_QMP_RETRY_SLEEP_MS));
+                    sleep(Duration::from_millis(DEFAULT_QMP_RETRY_SLEEP_MS)).await;
                 }
             }
         }
+        sample_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sampler.join();
 
         Err(last_err.unwrap_or_else(|| anyhow!("QMP init timed out")))
             .with_context(|| format!("timed out waiting for QMP ready: {}", qmp_sock_path))
@@ -1008,8 +1292,99 @@ impl Qmp {
         Err(anyhow!("no target device found"))
     }
 
+    fn set_qmp_read_timeout(&mut self, timeout: Duration) {
+        if let Err(e) = self
+            .qmp
+            .inner_mut()
+            .get_mut_write()
+            .set_read_timeout(Some(timeout))
+        {
+            warn!(sl!(), "Failed to set QMP read timeout {:?}: {:?}", timeout, e);
+        }
+    }
+
+    fn block_node_exists(&mut self, node_name: &str) -> bool {
+        match self
+            .qmp
+            .execute(&qapi_qmp::query_named_block_nodes { flat: Some(true) })
+        {
+            Ok(nodes) => nodes
+                .iter()
+                .any(|d| d.node_name.as_deref() == Some(node_name)),
+            Err(e) => {
+                warn!(
+                    sl!(),
+                    "query_named_block_nodes failed while checking {}: {:?}", node_name, e
+                );
+                false
+            }
+        }
+    }
+
+    fn existing_block_hotplug(
+        &mut self,
+        block_driver: &str,
+        index: u64,
+    ) -> Result<Option<(Option<PciPath>, Option<String>)>> {
+        let node_name = block_node_name(index);
+        let node_exists = self.block_node_exists(&node_name);
+        let device_exists = self.get_device_by_qdev_id(&node_name).is_ok();
+
+        if node_exists && device_exists {
+            info!(
+                sl!(),
+                "hotplug_block_device(): {} already attached, treating as success (fix15)",
+                node_name
+            );
+            return Ok(Some(self.block_hotplug_result(block_driver, index, &node_name)?));
+        }
+
+        if node_exists && !device_exists {
+            warn!(
+                sl!(),
+                "hotplug_block_device(): orphaned backend {}, deleting before retry (fix15)",
+                node_name
+            );
+            if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_del {
+                node_name: node_name.clone(),
+            }) {
+                warn!(
+                    sl!(),
+                    "hotplug_block_device(): blockdev_del of orphan {} failed: {:?}",
+                    node_name,
+                    e
+                );
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn block_hotplug_result(
+        &mut self,
+        block_driver: &str,
+        index: u64,
+        node_name: &str,
+    ) -> Result<(Option<PciPath>, Option<String>)> {
+        if block_driver == VIRTIO_SCSI {
+            let index_u16 = u16::try_from(index)?;
+            let scsi_id = (index_u16 >> 8) as u8;
+            let lun = (index_u16 & 0xFF) as u8;
+            Ok((None, Some(format!("{scsi_id}:{lun}"))))
+        } else if block_driver == VIRTIO_BLK_CCW {
+            Ok((None, Some(node_name.to_string())))
+        } else {
+            let pci_path = self
+                .get_device_by_qdev_id(node_name)
+                .context("get device by qdev_id failed")?;
+            Ok((Some(pci_path), None))
+        }
+    }
+
     /// Execute device_add for a block device. On failure, automatically
     /// rolls back the blockdev node added earlier to avoid orphaned resources.
+    /// Timeout / Duplicate must not roll back — QEMU may already own the node
+    /// (kata#11649).
     fn device_add_with_rollback(
         &mut self,
         node_name: &str,
@@ -1023,12 +1398,39 @@ impl Qmp {
             driver: driver.to_owned(),
             arguments,
         }) {
-            if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_del {
+            let msg = format!("{e:?}");
+            if qmp_err_is_duplicate(&msg) {
+                info!(
+                    sl!(),
+                    "device_add_with_rollback(): {} already present, treating as success (fix15)",
+                    node_name
+                );
+                return Ok(());
+            }
+            if qmp_err_is_timeout(&msg) && self.get_device_by_qdev_id(node_name).is_ok() {
+                warn!(
+                    sl!(),
+                    "device_add_with_rollback(): {} timed out but frontend exists (fix15)",
+                    node_name
+                );
+                return Ok(());
+            }
+            if qmp_err_is_timeout(&msg) {
+                warn!(
+                    sl!(),
+                    "device_add_with_rollback(): {} timed out; leaving backend (fix15)",
+                    node_name
+                );
+                return Err(anyhow!("device_add {:?}", e));
+            }
+            if let Err(del_err) = self.qmp.execute(&qapi_qmp::blockdev_del {
                 node_name: node_name.to_owned(),
             }) {
                 warn!(
                     sl!(),
-                    "device_add_with_rollback(): blockdev_del failed for {}: {:?}", node_name, e
+                    "device_add_with_rollback(): blockdev_del failed for {}: {:?}",
+                    node_name,
+                    del_err
                 );
             }
             return Err(anyhow!("device_add {:?}", e));
@@ -1073,17 +1475,9 @@ impl Qmp {
             thread::sleep(POLL_INTERVAL.min(deadline - now));
         };
 
-        // Reset the default read timeout for subsequent QMP operations.
-        // Failure here is non-fatal — a stale timeout only affects the next
-        // QMP read, not the already-completed device removal.
-        if let Err(e) = self
-            .qmp
-            .inner_mut()
-            .get_mut_write()
-            .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))
-        {
-            warn!(sl!(), "Failed to reset read timeout: {:?}", e);
-        }
+        // Keep the hotplug-sized timeout. Resetting to 250ms made the next
+        // container's EROFS blockdev-add fail WouldBlock (kata#11649 / fix15).
+        self.set_qmp_read_timeout(Duration::from_millis(DEFAULT_QMP_HOTPLUG_READ_TIMEOUT));
 
         result
     }
@@ -1144,6 +1538,10 @@ impl Qmp {
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = block_node_name(index);
+        self.set_qmp_read_timeout(Duration::from_millis(DEFAULT_QMP_HOTPLUG_READ_TIMEOUT));
+        if let Some(existing) = self.existing_block_hotplug(block_driver, index)? {
+            return Ok(existing);
+        }
         let discard_option = || discard_unmap.then_some(BlockdevDiscardOptions::unmap);
 
         let create_base_options = || qapi_qmp::BlockdevOptionsBase {
@@ -1236,10 +1634,24 @@ impl Qmp {
             }
         };
 
-        self.qmp
-            .execute(&qapi_qmp::blockdev_add(blockdev_options))
-            .map_err(|e| anyhow!("blockdev-add backend {:?}", e))
-            .map(|_| ())?;
+        if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_add(blockdev_options)) {
+            let msg = format!("{e:?}");
+            if qmp_err_is_duplicate(&msg) {
+                warn!(
+                    sl!(),
+                    "hotplug_block_device(): {} already present, continuing (fix15)",
+                    node_name
+                );
+            } else if qmp_err_is_timeout(&msg) && self.block_node_exists(&node_name) {
+                warn!(
+                    sl!(),
+                    "hotplug_block_device(): {} timed out but node exists, continuing (fix15)",
+                    node_name
+                );
+            } else {
+                return Err(anyhow!("blockdev-add backend {:?}", e));
+            }
+        }
 
         // block device
         // `device_add`
@@ -1689,4 +2101,41 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
 /// Generate a blockdev node name based on the given index.
 fn block_node_name(index: u64) -> String {
     format!("drive-{index}")
+}
+
+fn qmp_err_is_duplicate(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("duplicate nodes") || m.contains("is in use")
+}
+
+fn qmp_err_is_timeout(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("wouldblock")
+        || m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("resource temporarily unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{qmp_err_is_duplicate, qmp_err_is_timeout};
+
+    #[test]
+    fn duplicate_matches_qemu_qapi() {
+        assert!(qmp_err_is_duplicate(
+            r#"Qapi(Error { class: GenericError, desc: "Duplicate nodes with node-name='drive-5'", id: None })"#
+        ));
+        assert!(qmp_err_is_duplicate(
+            r#"Qapi(Error { class: GenericError, desc: "Node drive-5 is in use", id: None })"#
+        ));
+        assert!(!qmp_err_is_duplicate("blockdev-add backend other"));
+    }
+
+    #[test]
+    fn timeout_matches_so_rcvtimeo_wouldblock() {
+        assert!(qmp_err_is_timeout(
+            r#"Io(Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" })"#
+        ));
+        assert!(!qmp_err_is_timeout("GenericError"));
+    }
 }

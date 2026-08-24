@@ -250,6 +250,28 @@ impl ContainerManager for VirtContainerManager {
                         "container" => container_id,
                         "signal" => req.signal
                     );
+                    // #region agent log
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let payload = serde_json::json!({
+                        "sessionId": "b73125",
+                        "hypothesisId": "T1",
+                        "location": "container_manager.rs:kill_process",
+                        "message": "termination signal ignored; container does not exist",
+                        "data": {"container_id": container_id, "signal": req.signal},
+                        "timestamp": ts,
+                    });
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/run/debug-b73125.log")
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", payload);
+                    }
+                    // #endregion
                     return Ok(());
                 }
                 return Err(Error::ContainerNotFound(container_id.clone()).into());

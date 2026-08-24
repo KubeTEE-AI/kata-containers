@@ -156,11 +156,109 @@ pub async fn create_link(
     name: &str,
     queues: usize,
 ) -> Result<Box<dyn link::Link>> {
-    link::create_link(name, link::LinkType::Tap, queues)?;
+    let mut reused = false;
+    match link::create_link(name, link::LinkType::Tap, queues) {
+        Ok(()) => {}
+        Err(e) if link::is_busy_or_exist(&e) => {
+            // IFF_PERSIST leaves tapN_kata in the netns after a failed
+            // sandbox.start(); concurrent CreateContainer retries then hit
+            // TUNSETIFF EBUSY. Reuse the existing device instead of failing.
+            // fix12: distinguish "netdev visible, reuse" vs "FDs held / orphan".
+            reused = true;
+            // #region agent log
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let payload = serde_json::json!({
+                "sessionId": "b73125",
+                "hypothesisId": "H3",
+                "location": "network_pair.rs:create_link",
+                "message": "TUNSETIFF EBUSY matched; attempting reuse",
+                "data": {"name": name, "err": format!("{e:#}")},
+                "timestamp": ts,
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/debug-b73125.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", payload);
+            }
+            // #endregion
+            warn!(
+                sl!(),
+                "tap {} already exists ({}), reusing",
+                name,
+                e
+            );
+        }
+        Err(e) => {
+            // #region agent log
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let payload = serde_json::json!({
+                "sessionId": "b73125",
+                "hypothesisId": "H3",
+                "location": "network_pair.rs:create_link",
+                "message": "create_link failed and is_busy_or_exist=false",
+                "data": {"name": name, "err": format!("{e:#}")},
+                "timestamp": ts,
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/debug-b73125.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", payload);
+            }
+            // #endregion
+            return Err(e).context("create tap device");
+        }
+    }
 
-    let link = get_link_by_name(handle, name)
-        .await
-        .context("get link by name")?;
+    let link = match get_link_by_name(handle, name).await {
+        Ok(l) => l,
+        Err(lookup_err) if reused => {
+            // Device name is busy to TUNSETIFF but netlink cannot see it —
+            // typically another live process (orphan QEMU) holds the FDs.
+            // #region agent log
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let payload = serde_json::json!({
+                "sessionId": "b73125",
+                "hypothesisId": "H4",
+                "location": "network_pair.rs:create_link",
+                "message": "reuse matched but netlink miss; tap held by live process",
+                "data": {"name": name, "lookup_err": format!("{lookup_err:#}")},
+                "timestamp": ts,
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/debug-b73125.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", payload);
+            }
+            // #endregion
+            return Err(anyhow!(
+                "tap {} held by live process (TUNSETIFF EBUSY, netlink miss: {:#}); \
+                 kill orphan shim/QEMU or wait for start-fail reap (fix12)",
+                name,
+                lookup_err
+            ));
+        }
+        Err(lookup_err) => {
+            return Err(lookup_err).context("get link by name");
+        }
+    };
 
     let base = link.attrs();
     if base.master_index != 0 {

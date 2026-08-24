@@ -99,9 +99,57 @@ pub struct SandboxRestoreArgs {
     pub sender: Sender<Message>,
 }
 
+// #region agent log
+fn debug_b73125(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "sessionId": "b73125",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": ts,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/run/debug-b73125.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", payload);
+    }
+    info!(sl!(), "DEBUG_B73125 {}", payload);
+}
+
+struct DebugStartGuard {
+    sid: String,
+    disarmed: bool,
+}
+
+impl Drop for DebugStartGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            debug_b73125(
+                "H1",
+                "sandbox.rs:start:drop",
+                "start() dropped without cleanup/success (cancel or unwind)",
+                serde_json::json!({"sid": self.sid}),
+            );
+        }
+    }
+}
+// #endregion
+
 #[derive(Clone, Copy, PartialEq, Debug, Display)]
 pub enum SandboxState {
     Init,
+    /// Bring-up in progress (network + QEMU + agent). Distinct from Init so
+    /// concurrent CreateContainer calls do not re-enter `start()` and hit
+    /// TUNSETIFF EBUSY on an already-created `tapN_kata`.
+    Starting,
     Running,
     Stopped,
 }
@@ -110,7 +158,9 @@ impl SandboxState {
     fn to_cri_state(self) -> &'static str {
         match self {
             SandboxState::Running => "SANDBOX_READY",
-            SandboxState::Init | SandboxState::Stopped => "SANDBOX_NOTREADY",
+            SandboxState::Init | SandboxState::Starting | SandboxState::Stopped => {
+                "SANDBOX_NOTREADY"
+            }
         }
     }
 }
@@ -142,6 +192,10 @@ pub struct VirtSandbox {
     sid: String,
     msg_sender: Arc<Mutex<Sender<Message>>>,
     inner: Arc<RwLock<SandboxInner>>,
+    /// Serializes `sandbox.start()` without holding `inner` write across the
+    /// long QEMU/agent bring-up (fix5). Concurrent CreateContainer retries wait
+    /// here instead of racing `prepare_before_start_vm` / tap creation.
+    start_mutex: Arc<Mutex<()>>,
     resource_manager: Arc<ResourceManager>,
     agent: Arc<dyn Agent>,
     hypervisor: Arc<dyn Hypervisor>,
@@ -188,6 +242,7 @@ impl VirtSandbox {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(msg_sender)),
             inner: Arc::new(RwLock::new(SandboxInner::new())),
+            start_mutex: Arc::new(Mutex::new(())),
             agent,
             hypervisor,
             resource_manager,
@@ -213,8 +268,28 @@ impl VirtSandbox {
     }
 
     async fn record_stop(&self, exit_status: u32, exited_at: std::time::SystemTime) {
+        self.record_stop_inner(exit_status, exited_at, false).await;
+    }
+
+    /// Mark the sandbox Stopped. `force` is for an explicit StopSandbox
+    /// during Init/Starting. The background wait_vm task must not force:
+    /// a late QEMU exit during bring-up must not overwrite rollback to Init.
+    async fn record_stop_inner(
+        &self,
+        exit_status: u32,
+        exited_at: std::time::SystemTime,
+        force: bool,
+    ) {
         let mut inner = self.inner.write().await;
         if inner.state == SandboxState::Stopped {
+            return;
+        }
+        if !force
+            && matches!(
+                inner.state,
+                SandboxState::Init | SandboxState::Starting
+            )
+        {
             return;
         }
 
@@ -998,162 +1073,350 @@ impl Sandbox for VirtSandbox {
         }
         let sandbox_config = self.sandbox_config.as_ref().unwrap();
 
-        // if sandbox is not in SandboxState::Init then return,
-        // otherwise try to create sandbox
+        // #region agent log
+        let mut debug_start_guard = DebugStartGuard {
+            sid: id.clone(),
+            disarmed: false,
+        };
+        let debug_state = {
+            let inner = self.inner.read().await;
+            format!("{:?}", inner.state)
+        };
+        let debug_pids = self.hypervisor.get_pids().await.unwrap_or_default();
+        debug_b73125(
+            "H5",
+            "sandbox.rs:start:entry",
+            "sandbox.start() entered",
+            serde_json::json!({
+                "sid": id,
+                "state": debug_state,
+                "qemu_pids": debug_pids,
+            }),
+        );
+        // #endregion
 
-        let mut inner = self.inner.write().await;
-        if inner.state != SandboxState::Init {
-            warn!(sl!(), "sandbox is started");
-            return Ok(());
+        // Fast path: already running — CreateContainer for the app container
+        // after the sandbox container brought the VM up.
+        {
+            let inner = self.inner.read().await;
+            match inner.state {
+                SandboxState::Running => {
+                    warn!(sl!(), "sandbox is started");
+                    // #region agent log
+                    debug_start_guard.disarmed = true;
+                    debug_b73125(
+                        "H5",
+                        "sandbox.rs:start:fast_path",
+                        "start() fast-path Running (skip re-prepare)",
+                        serde_json::json!({"sid": id}),
+                    );
+                    // #endregion
+                    return Ok(());
+                }
+                SandboxState::Stopped => {
+                    debug_start_guard.disarmed = true;
+                    return Err(anyhow!("sandbox already stopped"));
+                }
+                SandboxState::Init | SandboxState::Starting => {}
+            }
         }
+
+        // Serialize bring-up. Do NOT hold `inner` write across QEMU/agent
+        // (fix5): that blocked Task/State RPCs. The start_mutex alone stops
+        // concurrent CreateContainer from racing tap creation (fix7 /
+        // kata-containers#13564 follow-up — TUNSETIFF EBUSY on tap0_kata).
+        let _start_guard = self.start_mutex.lock().await;
+
+        {
+            let mut inner = self.inner.write().await;
+            match inner.state {
+                SandboxState::Running => {
+                    warn!(sl!(), "sandbox is started");
+                    // #region agent log
+                    debug_start_guard.disarmed = true;
+                    debug_b73125(
+                        "H5",
+                        "sandbox.rs:start:fast_path_locked",
+                        "start() Running after mutex (skip re-prepare)",
+                        serde_json::json!({"sid": id}),
+                    );
+                    // #endregion
+                    return Ok(());
+                }
+                SandboxState::Stopped => {
+                    debug_start_guard.disarmed = true;
+                    return Err(anyhow!("sandbox already stopped"));
+                }
+                SandboxState::Starting => {
+                    // Should not happen under start_mutex; treat as in-progress
+                    // owner that somehow dropped the mutex — fail closed.
+                    debug_start_guard.disarmed = true;
+                    return Err(anyhow!(
+                        "sandbox start already in progress (state=Starting)"
+                    ));
+                }
+                SandboxState::Init => {
+                    inner.state = SandboxState::Starting;
+                }
+            }
+        }
+
         let selinux_label = load_oci_spec().ok().and_then(|spec| {
             spec.process()
                 .as_ref()
                 .and_then(|process| process.selinux_label().clone())
         });
 
-        self.hypervisor
-            .prepare_vm(
-                id,
-                sandbox_config.network_env.netns.clone(),
-                &sandbox_config.annotations,
-                selinux_label,
-            )
-            .await
-            .context("prepare vm")?;
-
-        let defer_network = self.should_defer_network().await?;
-
-        // generate device and setup before start vm
-        // should after hypervisor.prepare_vm
-        let resources = self.prepare_for_start_sandbox(id, sandbox_config).await?;
-
-        self.resource_manager
-            .prepare_before_start_vm(resources)
-            .await
-            .context("set up device before start vm")?;
-
-        // start vm
-        self.hypervisor.start_vm(10_000).await.context("start vm")?;
-        info!(sl!(), "start vm");
-
-        let sandbox = self.clone();
-        // wait for vm exit in background, and record the exit status and time when vm exited.
-        tokio::spawn(async move {
-            match sandbox.hypervisor.wait_vm().await {
-                Ok(exit_code) => {
-                    sandbox
-                        .record_stop(exit_code as u32, SystemTime::now())
-                        .await;
-                }
-                Err(err) => {
-                    warn!(sl!(), "failed waiting for sandbox VM exit: {:?}", err);
-                    sandbox.record_stop(255, SystemTime::now()).await;
-                }
-            }
-        });
-
-        // execute pre-start hook functions, including Prestart Hooks and CreateRuntime Hooks
-        let (prestart_hooks, create_runtime_hooks) =
-            if let Some(hooks) = sandbox_config.hooks.as_ref() {
-                (
-                    hooks.prestart().clone().unwrap_or_default(),
-                    hooks.create_runtime().clone().unwrap_or_default(),
+        let start_result = async {
+            self.hypervisor
+                .prepare_vm(
+                    id,
+                    sandbox_config.network_env.netns.clone(),
+                    &sandbox_config.annotations,
+                    selinux_label,
                 )
-            } else {
-                (Vec::new(), Vec::new())
+                .await
+                .context("prepare vm")?;
+
+            let defer_network = self.should_defer_network().await?;
+
+            // generate device and setup before start vm
+            // should after hypervisor.prepare_vm
+            let resources = self.prepare_for_start_sandbox(id, sandbox_config).await?;
+
+            self.resource_manager
+                .prepare_before_start_vm(resources)
+                .await
+                .context("set up device before start vm")?;
+
+            // start vm
+            self.hypervisor.start_vm(10_000).await.context("start vm")?;
+            info!(sl!(), "start vm");
+
+            let sandbox = self.clone();
+            // wait for vm exit in background, and record the exit status and time when vm exited.
+            tokio::spawn(async move {
+                match sandbox.hypervisor.wait_vm().await {
+                    Ok(exit_code) => {
+                        sandbox
+                            .record_stop(exit_code as u32, SystemTime::now())
+                            .await;
+                    }
+                    Err(err) => {
+                        warn!(sl!(), "failed waiting for sandbox VM exit: {:?}", err);
+                        sandbox.record_stop(255, SystemTime::now()).await;
+                    }
+                }
+            });
+
+            // fix13 / kata-containers#13598: if QEMU dies after QMP (stock
+            // guest image after kata-deploy re-extract, NVRC panic, …) do not
+            // sit in agent.connect until kubelet runtime-request-timeout=2h.
+            // wait_vm → record_stop publishes on exit_notify_tx.
+            let mut qemu_exit_rx = self.exit_notify_tx.subscribe();
+            let qemu_died = async {
+                while !*qemu_exit_rx.borrow() {
+                    if qemu_exit_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
             };
 
-        self.execute_oci_hook_functions(
-            &prestart_hooks,
-            &create_runtime_hooks,
-            &sandbox_config.state,
-        )
-        .await?;
+            let bring_up = async {
+                // execute pre-start hook functions, including Prestart Hooks and CreateRuntime Hooks
+                let (prestart_hooks, create_runtime_hooks) =
+                    if let Some(hooks) = sandbox_config.hooks.as_ref() {
+                        (
+                            hooks.prestart().clone().unwrap_or_default(),
+                            hooks.create_runtime().clone().unwrap_or_default(),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
 
-        // 1. if there are pre-start hook functions, network config might have been changed.
-        //    We need to rescan the netns to handle the change.
-        // 2. Do not scan the netns if we want no network for the VM.
-        // QEMU and Cloud Hypervisor advertise network hotplug support, so
-        // factory VMs using them defer network setup until after VM startup.
-        // Backends without this capability retain pre-start setup.
-        let config = self.resource_manager.config().await;
-        if self.has_prestart_hooks(&prestart_hooks, &create_runtime_hooks)
-            && !defer_network
-            && !config.runtime.disable_new_netns
-            && !dan_config_path(&config, &self.sid).exists()
-        {
-            if let Some(netns_path) = &sandbox_config.network_env.netns {
-                let network_resource = NetworkConfig::NetNs(NetworkWithNetNsConfig {
-                    network_model: config.runtime.internetworking_model.clone(),
-                    netns_path: netns_path.to_owned(),
-                    queues: self
+                self.execute_oci_hook_functions(
+                    &prestart_hooks,
+                    &create_runtime_hooks,
+                    &sandbox_config.state,
+                )
+                .await?;
+
+                // 1. if there are pre-start hook functions, network config might have been changed.
+                //    We need to rescan the netns to handle the change.
+                // 2. Do not scan the netns if we want no network for the VM.
+                // QEMU and Cloud Hypervisor advertise network hotplug support, so
+                // factory VMs using them defer network setup until after VM startup.
+                // Backends without this capability retain pre-start setup.
+                let config = self.resource_manager.config().await;
+                if self.has_prestart_hooks(&prestart_hooks, &create_runtime_hooks)
+                    && !defer_network
+                    && !config.runtime.disable_new_netns
+                    && !dan_config_path(&config, &self.sid).exists()
+                {
+                    if let Some(netns_path) = &sandbox_config.network_env.netns {
+                        let network_resource = NetworkConfig::NetNs(NetworkWithNetNsConfig {
+                            network_model: config.runtime.internetworking_model.clone(),
+                            netns_path: netns_path.to_owned(),
+                            queues: self
+                                .hypervisor
+                                .hypervisor_config()
+                                .await
+                                .network_info
+                                .network_queues as usize,
+                            network_created: sandbox_config.network_env.network_created,
+                        });
+                        self.resource_manager
+                            .handle_network(network_resource)
+                            .await
+                            .context("set up device after start vm")?;
+                    }
+                }
+
+                if defer_network {
+                    self.setup_deferred_network_after_start(sandbox_config)
+                        .await?;
+                }
+
+                // connect agent
+                // set agent socket
+                let address = self
+                    .hypervisor
+                    .get_agent_socket()
+                    .await
+                    .context("get agent socket")?;
+                self.agent
+                    .start(&address)
+                    .await
+                    .context(format!("connect to address {:?}", &address))?;
+                self.set_agent_policy().await.context("set agent policy")?;
+
+                self.resource_manager
+                    .setup_after_start_vm()
+                    .await
+                    .context("setup device after start vm")?;
+
+                // create sandbox in vm
+                let agent_config = self.agent.agent_config().await;
+                let kernel_modules = KernelModule::set_kernel_modules(agent_config.kernel_modules)?;
+                let req = agent::CreateSandboxRequest {
+                    hostname: sandbox_config.hostname.clone(),
+                    dns: sandbox_config.dns.clone(),
+                    storages: self
+                        .resource_manager
+                        .get_storage_for_sandbox(self.shm_size)
+                        .await
+                        .context("get storages for sandbox")?,
+                    sandbox_pidns: false,
+                    sandbox_id: id.to_string(),
+                    guest_hook_path: self
                         .hypervisor
                         .hypervisor_config()
                         .await
-                        .network_info
-                        .network_queues as usize,
-                    network_created: sandbox_config.network_env.network_created,
-                });
-                self.resource_manager
-                    .handle_network(network_resource)
+                        .security_info
+                        .guest_hook_path,
+                    kernel_modules,
+                };
+
+                self.agent
+                    .create_sandbox(req)
                     .await
-                    .context("set up device after start vm")?;
+                    .context("create sandbox")?;
+
+                Ok(())
+            };
+
+            tokio::select! {
+                _ = qemu_died => Err(anyhow!(
+                    "QEMU exited during sandbox start (agent/create_sandbox); failing fast (fix13 / kata-containers#13598)"
+                )),
+                res = bring_up => res,
             }
         }
+        .await;
 
-        if defer_network {
-            self.setup_deferred_network_after_start(sandbox_config)
-                .await?;
+        if let Err(ref e) = start_result {
+            // CreateContainer returns Err without calling StopSandbox when start
+            // fails — previously that left a running/zombie QEMU behind. stop_vm
+            // now also reaps (fix5). Also release host taps (IFF_PERSIST) so a
+            // retry does not hit TUNSETIFF EBUSY (fix7).
+            //
+            // fix12: use stop_vm_for_start_fail (bounded join) — non-blocking
+            // stop_vm (fix9, correct for Shutdown) races CreateContainer retries
+            // while QEMU still holds tap FDs → TUNSETIFF EBUSY.
+            error!(
+                sl!(),
+                "sandbox start failed: {:#}; stopping QEMU and releasing network", e
+            );
+            // #region agent log
+            let pids_before = self.hypervisor.get_pids().await.unwrap_or_default();
+            debug_b73125(
+                "H2",
+                "sandbox.rs:start:fail",
+                "start_result Err; running stop_vm_for_start_fail + release_network",
+                serde_json::json!({
+                    "sid": id,
+                    "err": format!("{:#}", e),
+                    "qemu_pids_before_reap": pids_before,
+                }),
+            );
+            // #endregion
+            const START_FAIL_REAP_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(60);
+            let _ = self
+                .hypervisor
+                .stop_vm_for_start_fail(START_FAIL_REAP_TIMEOUT)
+                .await;
+            if let Err(net_err) = self.resource_manager.release_network().await {
+                warn!(
+                    sl!(),
+                    "failed to release network after start failure: {:#}", net_err
+                );
+            }
+            {
+                let mut inner = self.inner.write().await;
+                if inner.state == SandboxState::Starting {
+                    inner.state = SandboxState::Init;
+                }
+            }
+            // #region agent log
+            let pids_after = self.hypervisor.get_pids().await.unwrap_or_default();
+            debug_b73125(
+                "H2",
+                "sandbox.rs:start:fail_after_reap",
+                "cleanup finished; state reset to Init if was Starting",
+                serde_json::json!({
+                    "sid": id,
+                    "qemu_pids_after_reap": pids_after,
+                }),
+            );
+            debug_start_guard.disarmed = true;
+            // #endregion
+            return start_result;
         }
 
-        // connect agent
-        // set agent socket
-        let address = self
-            .hypervisor
-            .get_agent_socket()
-            .await
-            .context("get agent socket")?;
-        self.agent
-            .start(&address)
-            .await
-            .context(format!("connect to address {:?}", &address))?;
-        self.set_agent_policy().await.context("set agent policy")?;
-
-        self.resource_manager
-            .setup_after_start_vm()
-            .await
-            .context("setup device after start vm")?;
-
-        // create sandbox in vm
-        let agent_config = self.agent.agent_config().await;
-        let kernel_modules = KernelModule::set_kernel_modules(agent_config.kernel_modules)?;
-        let req = agent::CreateSandboxRequest {
-            hostname: sandbox_config.hostname.clone(),
-            dns: sandbox_config.dns.clone(),
-            storages: self
-                .resource_manager
-                .get_storage_for_sandbox(self.shm_size)
-                .await
-                .context("get storages for sandbox")?,
-            sandbox_pidns: false,
-            sandbox_id: id.to_string(),
-            guest_hook_path: self
-                .hypervisor
-                .hypervisor_config()
-                .await
-                .security_info
-                .guest_hook_path,
-            kernel_modules,
-        };
-
-        self.agent
-            .create_sandbox(req)
-            .await
-            .context("create sandbox")?;
-
-        inner.state = SandboxState::Running;
-        inner.created_at = Some(std::time::SystemTime::now());
+        {
+            let mut inner = self.inner.write().await;
+            if inner.state != SandboxState::Starting {
+                warn!(
+                    sl!(),
+                    "sandbox left Starting during start (state={:?}); skipping Running transition",
+                    inner.state
+                );
+                debug_start_guard.disarmed = true;
+                return Ok(());
+            }
+            inner.state = SandboxState::Running;
+            inner.created_at = Some(std::time::SystemTime::now());
+        }
+        // #region agent log
+        debug_start_guard.disarmed = true;
+        debug_b73125(
+            "H5",
+            "sandbox.rs:start:running",
+            "sandbox reached Running",
+            serde_json::json!({"sid": id}),
+        );
+        // #endregion
 
         // get and store guest details
         self.store_guest_details()
@@ -1321,6 +1584,20 @@ impl Sandbox for VirtSandbox {
             sandbox_inner.state
         };
 
+        // #region agent log
+        let pids = self.hypervisor.get_pids().await.unwrap_or_default();
+        debug_b73125(
+            "T2",
+            "sandbox.rs:stop:entry",
+            "sandbox.stop() entered",
+            serde_json::json!({
+                "sid": self.sid,
+                "state": format!("{:?}", state),
+                "qemu_pids": pids,
+            }),
+        );
+        // #endregion
+
         if state == SandboxState::Stopped {
             return Ok(());
         }
@@ -1330,39 +1607,51 @@ impl Sandbox for VirtSandbox {
         self.cancel_token.cancel();
 
         info!(sl!(), "begin stop sandbox");
-        if state == SandboxState::Init {
-            let _ = self.hypervisor.stop_vm().await;
-            self.record_stop(0, SystemTime::now()).await;
-            info!(sl!(), "sandbox stopped during Init");
+        if state == SandboxState::Init || state == SandboxState::Starting {
+            // glm-0 (2026-08-13): start() holds start_mutex across start_vm +
+            // agent connect. Stock guest image after kata-deploy re-extract can
+            // kill QEMU while start() still waits on the agent (until kubelet
+            // runtime-request-timeout=2h). Awaiting the same mutex here made
+            // Shutdown wait that long too. Signal QEMU without waiting so
+            // start() fails fast (fix13 / kata-containers#13598) and drops
+            // the mutex. Keep the hostPID orphan-reaper for PPID=1 shims.
+            const START_FAIL_REAP_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(60);
+            match self.start_mutex.try_lock() {
+                Ok(_guard) => {
+                    let _ = self.hypervisor.stop_vm().await;
+                }
+                Err(_) => {
+                    warn!(
+                        sl!(),
+                        "sandbox.stop: start in progress; signaling QEMU without waiting on start_mutex"
+                    );
+                    let _ = self
+                        .hypervisor
+                        .stop_vm_for_start_fail(START_FAIL_REAP_TIMEOUT)
+                        .await;
+                }
+            }
+            if let Err(err) = self.resource_manager.release_network().await {
+                warn!(sl!(), "failed to release network during stop: {:#}", err);
+            }
+            self.record_stop_inner(0, SystemTime::now(), true).await;
+            info!(sl!(), "sandbox stopped during {:?}", state);
             return Ok(());
         }
 
+        // fix9 (kata-containers#13564): stop_vm() only start_kill's QEMU and
+        // returns. Do NOT await wait() for the full reclaim of a large TDX/CC
+        // guest (can be many minutes) — that blocks Shutdown until containerd
+        // SIGKILLs the shim, orphaning a still-live QEMU under init. Mark
+        // Stopped now; QEMU's PR_SET_PDEATHSIG covers shim exit/death.
+        // fix10: stop_vm takes the Child and reaps on an OS thread (try_wait),
+        // so a cancelled tokio wait_vm cannot leave a zombie under an orphaned
+        // shim. Same non-blocking pattern as the Init/Starting branch above.
         self.hypervisor.stop_vm().await.context("stop vm")?;
-        self.wait().await.context("wait for vm exit after stop")?;
-        info!(sl!(), "sandbox stopped");
+        self.record_stop(0, SystemTime::now()).await;
+        info!(sl!(), "sandbox stop signaled (not waiting for qemu exit)");
 
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        info!(sl!(), "shutdown");
-
-        self.stop().await.context("stop")?;
-
-        self.cleanup().await.context("do the clean up")?;
-
-        info!(sl!(), "stop monitor");
-        self.monitor.stop().await;
-
-        info!(sl!(), "stop agent");
-        self.agent.stop().await;
-
-        // stop server
-        info!(sl!(), "send shutdown message");
-        let msg = Message::new(Action::Shutdown);
-        let sender = self.msg_sender.clone();
-        let sender = sender.lock().await;
-        sender.send(msg).await.context("send shutdown msg")?;
         Ok(())
     }
 
@@ -1659,6 +1948,7 @@ impl Persist for VirtSandbox {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(sandbox_args.sender)),
             inner: Arc::new(RwLock::new(SandboxInner::new())),
+            start_mutex: Arc::new(Mutex::new(())),
             agent,
             hypervisor,
             resource_manager,

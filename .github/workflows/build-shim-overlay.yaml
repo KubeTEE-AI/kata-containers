@@ -24,8 +24,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix18: sandbox-id Kill/Wait calls stop_vm (stuck Terminating).
-  # Keeps fix17 exact PCI class list + fix16 inotify + fix15 blockdev-add.
+  # fix19: 4.1.0 rebase + QEMU/T15/inotify/blockdev stack (stock #13524 class list).
+  # Does not re-apply IOMMUFD experiments. Staging debug stays.
   SHIM_TAG: v4.1.0-nvswitch-fix19
 
 jobs:
