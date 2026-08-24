@@ -1,0 +1,142 @@
+name: Build and Publish Kata Shim Overlay NVSwitch
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - kubetee-staging
+    paths:
+      - 'src/runtime-rs/crates/hypervisor/src/device/driver/vfio_device/core.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/inner.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/mod.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs'
+      - 'src/runtime-rs/crates/runtimes/src/manager.rs'
+      - 'src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs'
+      - 'src/runtime-rs/crates/resource/src/network/**'
+      - 'src/runtime-rs/crates/resource/src/manager.rs'
+      - 'src/runtime-rs/crates/resource/src/manager_inner.rs'
+      - 'src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs'
+      - 'src/runtime-rs/crates/hypervisor/src/lib.rs'
+      - 'tools/kubetee-shim-overlay/**'
+      - '.github/workflows/build-shim-overlay.yaml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
+  # fix18: sandbox-id Kill/Wait calls stop_vm (stuck Terminating).
+  # Keeps fix17 exact PCI class list + fix16 inotify + fix15 blockdev-add.
+  SHIM_TAG: v4.1.0-nvswitch-fix19
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout kata-containers fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup default 1.88.0
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools clang llvm protobuf-compiler libseccomp-dev
+
+      - name: Verify patches are present
+        run: |
+          echo "Checking for exact PCI class ignore list (NVSwitch 0x0680 kept; no 0x0600 bitmask)"
+          grep -n 'IOMMU_IGNORE_CLASSES: &\[u16\] = &\[0x0600, 0x0604, 0x0403\]' src/runtime-rs/crates/hypervisor/src/device/driver/vfio_device/core.rs
+          echo "Checking for zombie QEMU fix in inner.rs"
+          grep -n "stop_vm" src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
+          echo "Checking for fix7 start_mutex / Starting state"
+          grep -n 'start_mutex' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
+          grep -n 'SandboxState::Starting' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
+          grep -n 'is_busy_or_exist' src/runtime-rs/crates/resource/src/network/utils/link/create.rs | head -3
+          grep -n 'release_network' src/runtime-rs/crates/resource/src/manager.rs | head -3
+          echo "Checking for fix8 start_kill / wait outside lock"
+          grep -n 'start_kill' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
+          grep -n 'qemu_pid' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
+          echo "Checking for fix9 PDEATHSIG + non-blocking stop"
+          grep -n 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -3
+          grep -n 'not waiting for qemu exit' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
+          echo "Checking for fix10 OS-thread reaper"
+          grep -n 'spawn_os_reaper\|fix10 OS reaper\|take_qemu_child' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -10
+          echo "Checking for fix11 timed QMP connect / drop listen FD"
+          grep -n 'connect_unix_timeout\|drop_qmp_listen_fd\|kill_and_os_reap_qemu\|Qmp::connect'             src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs             src/runtime-rs/crates/hypervisor/src/qemu/inner.rs             src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs | head -15
+          echo "Checking for fix12 start-fail bounded reap + tap held messaging"
+          grep -n 'stop_vm_for_start_fail\|fix12' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/lib.rs | head -10
+          grep -n 'stop_vm_for_start_fail\|START_FAIL_REAP' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
+          grep -n 'held by live process\|nix::errno::Errno' src/runtime-rs/crates/resource/src/network/network_pair.rs src/runtime-rs/crates/resource/src/network/utils/link/create.rs | head -10
+          grep -n 'orphan-reaper\|ORPHAN_GRACE' tools/kubetee-shim-overlay/overlay.sh | head -5
+          echo "Checking for fix13 start_mutex try_lock / QEMU-death fail-fast"
+          grep -n 'try_lock' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
+          grep -n 'failing fast (fix13' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
+          echo "Checking for fix15 idempotent blockdev-add / hotplug timeout"
+          grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT\|existing_block_hotplug\|qmp_err_is_duplicate' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -10
+          echo "Checking for fix16 inotify close off tokio"
+          grep -n 'InotifyCloseOnThread\|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -10
+          echo "Checking for fix18 sandbox-id Kill/Wait → stop_vm"
+          grep -n 'stop sandbox on sandbox-id kill' src/runtime-rs/crates/runtimes/src/manager.rs
+          grep -n 'sandbox-id Wait missing container' src/runtime-rs/crates/runtimes/src/manager.rs
+          git log --oneline -1
+
+      - name: Generate config.rs
+        working-directory: src/runtime-rs
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          mkdir -p crates/shim/src
+          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.1.0";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
+          cat crates/shim/src/config.rs
+
+      - name: Build containerd-shim-kata-v2
+        working-directory: src/runtime-rs
+        run: |
+          set -eux
+          cargo build --release --target x86_64-unknown-linux-musl --bin containerd-shim-kata-v2
+          # Workspace cargo target-dir is the repo root (not src/runtime-rs/target).
+          BIN="../../target/x86_64-unknown-linux-musl/release/containerd-shim-kata-v2"
+          if [ ! -f "$BIN" ]; then
+            echo "ERROR: expected binary missing at $BIN; searching..."
+            find ../.. -name 'containerd-shim-kata-v2' -type f 2>/dev/null | head -10 || true
+            exit 1
+          fi
+          echo "Binary found at: $BIN"
+          cp "$BIN" ./containerd-shim-kata-v2
+          ls -la ./containerd-shim-kata-v2
+          sha256sum ./containerd-shim-kata-v2
+          file ./containerd-shim-kata-v2
+
+      - name: Stage binary and create overlay image
+        run: |
+          mkdir -p overlay-image
+          cp src/runtime-rs/containerd-shim-kata-v2 overlay-image/
+          cp tools/kubetee-shim-overlay/overlay.sh overlay-image/overlay.sh
+          chmod 755 overlay-image/overlay.sh
+          printf 'FROM alpine:3.22\nCOPY containerd-shim-kata-v2 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u pamanseau --password-stdin
+
+      - name: Build and push overlay image
+        run: |
+          docker buildx build --platform linux/amd64 \
+            -f overlay-image/Dockerfile \
+            -t ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} \
+            --push \
+            overlay-image/
+          echo "Pushed ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG}"
+
+      - name: Verify image
+        run: |
+          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} sha256sum /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 || true
+          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} grep -n orphan-reaper /overlay.sh | head -5
