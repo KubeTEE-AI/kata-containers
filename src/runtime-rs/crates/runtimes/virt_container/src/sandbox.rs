@@ -1655,6 +1655,28 @@ impl Sandbox for VirtSandbox {
         Ok(())
     }
 
+    async fn shutdown(&self) -> Result<()> {
+        info!(sl!(), "shutdown");
+
+        self.stop().await.context("stop")?;
+
+        self.cleanup().await.context("do the clean up")?;
+
+        info!(sl!(), "stop monitor");
+        self.monitor.stop().await;
+
+        info!(sl!(), "stop agent");
+        self.agent.stop().await;
+
+        // stop server
+        info!(sl!(), "send shutdown message");
+        let msg = Message::new(Action::Shutdown);
+        let sender = self.msg_sender.clone();
+        let sender = sender.lock().await;
+        sender.send(msg).await.context("send shutdown msg")?;
+        Ok(())
+    }
+
     async fn cleanup(&self) -> Result<()> {
         // Teardown may be triggered both when the sandbox container exits and
         // by a later shutdown RPC; only release the resources once.
