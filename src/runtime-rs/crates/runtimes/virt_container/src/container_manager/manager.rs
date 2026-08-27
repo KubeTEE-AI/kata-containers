@@ -490,4 +490,15 @@ impl ContainerManager for VirtContainerManager {
         process.process_type == ProcessType::Container
             && process.container_id.container_id == self.sid
     }
+
+    async fn has_guest_container(&self, process: &ContainerProcess) -> bool {
+        self.containers
+            .read()
+            .await
+            .contains_key(&process.container_id.container_id)
+    }
+
+    async fn guest_map_is_empty(&self) -> bool {
+        self.containers.read().await.is_empty()
+    }
 }

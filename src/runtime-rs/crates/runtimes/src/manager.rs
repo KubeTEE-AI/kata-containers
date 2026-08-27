@@ -7,6 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 use common::{
     message::{Action, Message},
+    should_stop_vm_on_missing_task,
     types::{
         ContainerProcess, PlatformInfo, ProcessExitStatus, ProcessType, SandboxConfig,
         SandboxRequest, SandboxResponse, SandboxStatusInfo, StartSandboxInfo, TaskRequest,
@@ -687,40 +688,48 @@ impl RuntimeHandlerManager {
             }
             TaskRequest::KillProcess(req) => {
                 cm.kill_process(&req).await.context("kill process")?;
-                // T15: containerd registers the sandbox/pause task with the
-                // QEMU pid (ctr tasks: sid RUNNING pid=qemu). StopPodSandbox
-                // Kills that id; the shim has no guest container for it
-                // ("Signal 9 ignored"), so nobody called stop() and Wait
-                // blocked on the live TDX QEMU. Signal the VM on sandbox-id
-                // Kill (non-blocking stop_vm / fix9).
-                if cm.is_sandbox_container(&req.process).await {
+                // T15: sandbox/pause id. Leftover Unknown init: CRI Kills a
+                // container that never entered the shim map; guest map empty
+                // means only pause/QEMU remain (do not stop a live sibling).
+                let is_sandbox = cm.is_sandbox_container(&req.process).await;
+                let stop_vm = should_stop_vm_on_missing_task(
+                    is_sandbox,
+                    req.process.process_type == ProcessType::Container,
+                    cm.has_guest_container(&req.process).await,
+                    cm.guest_map_is_empty().await,
+                );
+                if stop_vm {
                     // #region agent log
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis())
                         .unwrap_or(0);
                     let payload = serde_json::json!({
-                        "sessionId": "b73125",
-                        "hypothesisId": "T15",
+                        "sessionId": "d1e886",
+                        "hypothesisId": "T16",
                         "location": "manager.rs:KillProcess",
-                        "message": "sandbox-id Kill; calling stop_vm",
-                        "data": {"container_id": req.process.container_id(), "signal": req.signal},
+                        "message": "missing-task Kill; calling stop_vm",
+                        "data": {
+                            "container_id": req.process.container_id(),
+                            "signal": req.signal,
+                            "is_sandbox": is_sandbox,
+                        },
                         "timestamp": ts,
                     });
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open("/run/debug-b73125.log")
+                        .open("/run/debug-d1e886.log")
                     {
                         use std::io::Write;
                         let _ = writeln!(f, "{}", payload);
                     }
-                    info!(sl!(), "DEBUG_B73125 {}", payload);
+                    info!(sl!(), "DEBUG_D1E886 {}", payload);
                     // #endregion
                     sandbox
                         .stop()
                         .await
-                        .context("stop sandbox on sandbox-id kill")?;
+                        .context("stop sandbox on missing-task kill")?;
                 }
                 Ok(TaskResponse::KillProcess)
             }
@@ -737,39 +746,48 @@ impl RuntimeHandlerManager {
             }
             TaskRequest::WaitProcess(process_id) => {
                 let is_sandbox = cm.is_sandbox_container(&process_id).await;
+                let stop_vm = should_stop_vm_on_missing_task(
+                    is_sandbox,
+                    process_id.process_type == ProcessType::Container,
+                    cm.has_guest_container(&process_id).await,
+                    cm.guest_map_is_empty().await,
+                );
                 let exit_status = match cm.wait_process(&process_id).await {
                     Ok(status) => status,
-                    Err(err) if is_sandbox => {
-                        // T15: pause task exists in containerd but was never
-                        // in the shim container map (start failed after QEMU
-                        // pid was published). Wait would error and containerd
-                        // waitpid's QEMU forever.
+                    Err(err) if stop_vm => {
+                        // T15 / leftover Unknown init: CRI task is not in the
+                        // guest map. Return synthetic 137 so StopContainer
+                        // completes and the VM is stopped.
                         // #region agent log
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
                         let payload = serde_json::json!({
-                            "sessionId": "b73125",
-                            "hypothesisId": "T15",
+                            "sessionId": "d1e886",
+                            "hypothesisId": "T16",
                             "location": "manager.rs:WaitProcess",
-                            "message": "sandbox-id Wait missing container; stop_vm + synthetic exit",
-                            "data": {"container_id": process_id.container_id(), "err": format!("{err:#}")},
+                            "message": "missing-task Wait; stop_vm + synthetic exit",
+                            "data": {
+                                "container_id": process_id.container_id(),
+                                "err": format!("{err:#}"),
+                                "is_sandbox": is_sandbox,
+                            },
                             "timestamp": ts,
                         });
                         if let Ok(mut f) = std::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
-                            .open("/run/debug-b73125.log")
+                            .open("/run/debug-d1e886.log")
                         {
                             use std::io::Write;
                             let _ = writeln!(f, "{}", payload);
                         }
-                        info!(sl!(), "DEBUG_B73125 {}", payload);
+                        info!(sl!(), "DEBUG_D1E886 {}", payload);
                         // #endregion
                         warn!(
                             sl!(),
-                            "wait sandbox container missing ({:#}); stopping VM", err
+                            "wait missing container ({:#}); stopping VM", err
                         );
                         let mut status = ProcessExitStatus::new();
                         status.update_exit_code(137);
@@ -777,7 +795,7 @@ impl RuntimeHandlerManager {
                     }
                     Err(err) => return Err(err).context("wait process"),
                 };
-                if is_sandbox {
+                if stop_vm {
                     sandbox.stop().await.context("stop sandbox")?;
 
                     // Release sandbox resources (cgroup, network, mounts, ...)
