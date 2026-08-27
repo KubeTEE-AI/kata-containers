@@ -24,9 +24,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix19: 4.1.0 rebase + QEMU/T15/inotify/blockdev stack (stock #13524 class list).
-  # Does not re-apply IOMMUFD experiments. Staging debug stays.
-  SHIM_TAG: v4.1.0-nvswitch-fix19
+  # fix20: T16 leftover Unknown-init Kill/Wait → stop_vm (empty guest map).
+  # Still 4.1.0 + QEMU/T15/inotify/blockdev. Does not re-apply IOMMUFD.
+  SHIM_TAG: v4.1.0-nvswitch-fix20
 
 jobs:
   build-and-push:
@@ -83,9 +83,10 @@ jobs:
           grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT\|existing_block_hotplug\|qmp_err_is_duplicate' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -10
           echo "Checking for fix16 inotify close off tokio"
           grep -n 'InotifyCloseOnThread\|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -10
-          echo "Checking for fix18 sandbox-id Kill/Wait → stop_vm"
-          grep -n 'stop sandbox on sandbox-id kill' src/runtime-rs/crates/runtimes/src/manager.rs
-          grep -n 'sandbox-id Wait missing container' src/runtime-rs/crates/runtimes/src/manager.rs
+          echo "Checking for fix18/T16 missing-task Kill/Wait → stop_vm"
+          grep -n 'should_stop_vm_on_missing_task' src/runtime-rs/crates/runtimes/src/manager.rs src/runtime-rs/crates/runtimes/common/src/container_manager.rs
+          grep -n 'stop sandbox on missing-task kill' src/runtime-rs/crates/runtimes/src/manager.rs
+          grep -n 'missing-task Wait' src/runtime-rs/crates/runtimes/src/manager.rs
           git log --oneline -1
 
       - name: Generate config.rs
