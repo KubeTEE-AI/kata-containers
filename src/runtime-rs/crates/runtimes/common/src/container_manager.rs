@@ -47,8 +47,10 @@ pub trait ContainerManager: Send + Sync {
 /// Leftover Unknown init: kubelet StopContainer of a CRI id that never
 /// entered the shim map (e.g. `fetch-certs` after a node reboot). Wait
 /// then errors and never reaches sandbox-id Kill. An empty guest map
-/// means only the pause/QEMU remain — safe to stop. Do **not** stop when
-/// another guest container is still in the map (init CrashLoop retry).
+/// (no workload containers; the pause/sandbox entry does not count —
+/// fix21) means only the pause/QEMU remain — safe to stop. Do **not**
+/// stop when another guest container is still in the map (init
+/// CrashLoop retry).
 pub fn should_stop_vm_on_missing_task(
     is_sandbox: bool,
     is_container_process: bool,

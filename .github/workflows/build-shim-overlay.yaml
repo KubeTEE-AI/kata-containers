@@ -24,9 +24,11 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix20: T16 leftover Unknown-init Kill/Wait → stop_vm (empty guest map).
+  # fix21: T16 guest_map_is_empty ignores the pause/sandbox entry —
+  # leftover Unknown-init Kill/Wait now stops the VM (fix20 never fired
+  # because the pause container made the map look non-empty).
   # Still 4.1.0 + QEMU/T15/inotify/blockdev. Does not re-apply IOMMUFD.
-  SHIM_TAG: v4.1.0-nvswitch-fix20
+  SHIM_TAG: v4.1.0-nvswitch-fix21
 
 jobs:
   build-and-push:
