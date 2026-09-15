@@ -43,14 +43,27 @@ jobs:
             -e package_output_dir=IntelTdx \
             quay.io/kata-containers/builders:ovmf-fc8df7157-x86_64 \
             bash /src/tools/packaging/static-build/ovmf/build-ovmf.sh
-          test -f out/opt/kata/share/ovmf/OVMF.inteltdx.fd
-          sha256sum out/opt/kata/share/ovmf/OVMF.inteltdx.fd
-          stat -c '%s bytes' out/opt/kata/share/ovmf/OVMF.inteltdx.fd
+          # build-ovmf.sh tars ./opt into <ovmf_dir>-tdx.tar.gz and then
+          # REMOVES the installed tree — recover the fd from the tarball
+          # (fallback: unpacked path, in case the script changes).
+          TARBALL=$(ls -1 out/*.tar.gz | head -1)
+          mkdir -p out/x && tar xzf "$TARBALL" -C out/x
+          if [ -f out/x/opt/kata/share/ovmf/OVMF.inteltdx.fd ]; then
+            cp out/x/opt/kata/share/ovmf/OVMF.inteltdx.fd out/OVMF.inteltdx.fd
+          elif [ -f out/opt/kata/share/ovmf/OVMF.inteltdx.fd ]; then
+            cp out/opt/kata/share/ovmf/OVMF.inteltdx.fd out/OVMF.inteltdx.fd
+          else
+            echo "ERROR: OVMF.inteltdx.fd not found in tarball or unpacked tree" >&2
+            find out -name '*.fd' -o -name '*.tar.gz' >&2
+            exit 1
+          fi
+          sha256sum out/OVMF.inteltdx.fd
+          stat -c '%s bytes' out/OVMF.inteltdx.fd
 
       - name: Stage overlay image
         run: |
           mkdir -p overlay-image
-          cp out/opt/kata/share/ovmf/OVMF.inteltdx.fd overlay-image/
+          cp out/OVMF.inteltdx.fd overlay-image/
           cp tools/kubetee-ovmf-overlay/overlay.sh overlay-image/overlay.sh
           chmod 755 overlay-image/overlay.sh
           printf 'FROM alpine:3.22\nCOPY OVMF.inteltdx.fd /opt/kata/share/ovmf/OVMF.inteltdx.fd\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
