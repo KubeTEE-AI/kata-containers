@@ -35,7 +35,16 @@ lazy_static! {
         m.insert("0x10de-0x030", "nvidia.com/gpu");
         m.insert("0x8086-0x030", "intel.com/gpu");
         m.insert("0x1002-0x030", "amd.com/gpu");
-        m.insert("0x15b3-0x020", "nvidia.com/nic");
+        // KubeTEE fix22: "0x15b3-0x020" -> "nvidia.com/nic" REMOVED.
+        // The in-guest NVRC's `nvidia-ctk cdi generate` only emits the
+        // nvidia.com/gpu class, so an nvidia.com/nic annotation makes the
+        // kata-agent wait 100s for a CDI spec that never appears ->
+        // "failed to inject devices after CDI timeout of 100 seconds"
+        // StartError (same class as the NVSwitch fix3 incident). The guest
+        // agent's expose_guest_infiniband_devices() already injects
+        // /dev/infiniband/* char devices into the container when VFIO
+        // devices are present — CDI is not needed for NIC passthrough.
+        // Hit on michigan-97 2026-09-15 (IB PoC, 8x CX7 + 8x H200 TDX).
         // TODO:  it will be updated as required.
         m
     };
