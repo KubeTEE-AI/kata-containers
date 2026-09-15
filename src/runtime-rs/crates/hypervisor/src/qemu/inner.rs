@@ -508,9 +508,10 @@ impl QemuInner {
         // only cleaned up on the QMP-init / boot_from_template paths (fix4),
         // missing virtio-mem setup, resume_vm, console connect, and any future
         // `?` after spawn. fix5: cleanup on every failure path below.
-        // fix11: drop parent's QMP listen FD so a dead QEMU cannot leave a
-        // non-accepting listener that wedges unbounded connect(2).
-        cmdline.drop_qmp_listen_fd();
+        // fix11 (subsumed by 4.2.0): dropping the whole QemuCmdLine right after
+        // spawn (see `drop(cmdline)` above, from #13546/#13548) already closes
+        // the parent's QMP listen FD (QmpSockType::Fd holds the File). No
+        // separate drop_qmp_listen_fd() call is needed anymore.
 
         let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
         // sandbox passes 10_000 (ms). Keep at least the historical 50s QMP
