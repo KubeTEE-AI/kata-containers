@@ -1,0 +1,78 @@
+name: Build and Publish Kata OVMF Overlay (TDX lazy-accept)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - kubetee-staging
+    paths:
+      - 'tools/kubetee-ovmf-overlay/**'
+      - '.github/workflows/build-ovmf-overlay.yaml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/kata-deploy-ovmf-overlay
+  # edk2-stable202608 (tag 2970e569…): 202605 + the TDVF below-4G low-memory
+  # fix c0c8ca0ea0 (the probable root cause of kata's 202605 revert — see
+  # kata-containers#13535). Built with the official #13631 packaging path
+  # (builder ovmf-fc8df7157-x86_64, toolchain GCC, RELEASE), same as the
+  # previous v202605-kata-13631 image (fd 48c3a186…).
+  OVMF_TAG: v202608-kata-13631
+  OVMF_VERSION: edk2-stable202608
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout kata-containers fork
+        uses: actions/checkout@v4
+
+      - name: Build OVMF.inteltdx.fd (official packaging path)
+        run: |
+          set -eux
+          mkdir -p out
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$PWD/out:/out" -w /out \
+            -e DESTDIR=/out -e PREFIX=/opt/kata -e ovmf_build=tdx \
+            -e ovmf_repo=https://github.com/tianocore/edk2 \
+            -e ovmf_version=${OVMF_VERSION} \
+            -e ovmf_package=OvmfPkg/IntelTdx/IntelTdxX64.dsc \
+            -e package_output_dir=IntelTdx \
+            quay.io/kata-containers/builders:ovmf-fc8df7157-x86_64 \
+            bash /src/tools/packaging/static-build/ovmf/build-ovmf.sh
+          test -f out/opt/kata/share/ovmf/OVMF.inteltdx.fd
+          sha256sum out/opt/kata/share/ovmf/OVMF.inteltdx.fd
+          stat -c '%s bytes' out/opt/kata/share/ovmf/OVMF.inteltdx.fd
+
+      - name: Stage overlay image
+        run: |
+          mkdir -p overlay-image
+          cp out/opt/kata/share/ovmf/OVMF.inteltdx.fd overlay-image/
+          cp tools/kubetee-ovmf-overlay/overlay.sh overlay-image/overlay.sh
+          chmod 755 overlay-image/overlay.sh
+          printf 'FROM alpine:3.22\nCOPY OVMF.inteltdx.fd /opt/kata/share/ovmf/OVMF.inteltdx.fd\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u pamanseau --password-stdin
+
+      - name: Build and push overlay image
+        run: |
+          docker buildx build --platform linux/amd64 \
+            -f overlay-image/Dockerfile \
+            -t ${REGISTRY}/${IMAGE_NAME}:${OVMF_TAG} \
+            --push \
+            overlay-image/
+          echo "Pushed ${REGISTRY}/${IMAGE_NAME}:${OVMF_TAG}"
+
+      - name: Verify image
+        run: |
+          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${OVMF_TAG} sha256sum /opt/kata/share/ovmf/OVMF.inteltdx.fd
+
+      - name: Record image digest
+        run: |
+          docker buildx imagetools inspect ${REGISTRY}/${IMAGE_NAME}:${OVMF_TAG} | head -10
