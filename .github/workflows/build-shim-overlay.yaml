@@ -24,11 +24,16 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix21: T16 guest_map_is_empty ignores the pause/sandbox entry —
-  # leftover Unknown-init Kill/Wait now stops the VM (fix20 never fired
-  # because the pause container made the map look non-empty).
-  # Still 4.1.0 + QEMU/T15/inotify/blockdev. Does not re-apply IOMMUFD.
-  SHIM_TAG: v4.1.0-nvswitch-fix21
+  # fix1 (4.2.0 rebase): the full KubeTEE stack (QEMU start/stop serialization,
+  # tap EBUSY reclaim, PDEATHSIG, OS-thread reap, timed QMP connect,
+  # stop_vm_for_start_fail, try_lock stop, qemu_died fail-fast, fix15
+  # idempotent blockdev-add, fix16 inotify close-off-runtime, T15 sandbox-id
+  # Kill/Wait, T16 guest_map_is_empty ignoring the pause entry, fix22 no
+  # nvidia.com/nic CDI mapping) rebased onto kata 4.2.0 (c7351e797), keeping
+  # 4.2.0's fd-passing (#13546/#13548), console-watcher-before-start (#13437),
+  # and RLIMIT_MEMLOCK raise. All nine upstream PRs closed unmerged 2026-09-13
+  # — this stack is ours alone again.
+  SHIM_TAG: v4.2.0-nvswitch-fix1
 
 jobs:
   build-and-push:
@@ -44,7 +49,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup default 1.88.0
+          rustup toolchain install 1.96.0 || true
+          rustup default 1.96.0
           rustup target add x86_64-unknown-linux-musl
 
       - name: Install build dependencies
@@ -96,7 +102,7 @@ jobs:
         run: |
           COMMIT=$(git rev-parse --short HEAD)
           mkdir -p crates/shim/src
-          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.1.0";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
+          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.2.0";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
           cat crates/shim/src/config.rs
 
       - name: Build containerd-shim-kata-v2
