@@ -56,12 +56,6 @@ jobs:
           echo "Confirming NO other fix classes are carried (minimal overlay):"
           ! grep -q 'start_mutex' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs || (echo "UNEXPECTED start_mutex present" && exit 1)
           ! grep -q 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs || (echo "UNEXPECTED set_pdeathsig present" && exit 1)
-          echo "Checking for fix16 inotify close off tokio"
-          grep -n 'InotifyCloseOnThread\|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -10
-          echo "Checking for fix18/T16 missing-task Kill/Wait → stop_vm"
-          grep -n 'should_stop_vm_on_missing_task' src/runtime-rs/crates/runtimes/src/manager.rs src/runtime-rs/crates/runtimes/common/src/container_manager.rs
-          grep -n 'stop sandbox on missing-task kill' src/runtime-rs/crates/runtimes/src/manager.rs
-          grep -n 'missing-task Wait' src/runtime-rs/crates/runtimes/src/manager.rs
           git log --oneline -1
 
       - name: Generate config.rs
