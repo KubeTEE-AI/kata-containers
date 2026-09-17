@@ -1,0 +1,118 @@
+name: Build and Publish Kata Shim Overlay NVSwitch
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - kubetee-fix11649-only
+    paths:
+      - 'src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs'
+      - 'tools/kubetee-shim-overlay/**'
+      - '.github/workflows/build-shim-overlay.yaml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
+  # fix1 (4.2.0 rebase): the full KubeTEE stack (QEMU start/stop serialization,
+  # tap EBUSY reclaim, PDEATHSIG, OS-thread reap, timed QMP connect,
+  # stop_vm_for_start_fail, try_lock stop, qemu_died fail-fast, fix15
+  # idempotent blockdev-add, fix16 inotify close-off-runtime, T15 sandbox-id
+  # Kill/Wait, T16 guest_map_is_empty ignoring the pause entry, fix22 no
+  # nvidia.com/nic CDI mapping) rebased onto kata 4.2.0 (c7351e797), keeping
+  # 4.2.0's fd-passing (#13546/#13548), console-watcher-before-start (#13437),
+  # and RLIMIT_MEMLOCK raise. All nine upstream PRs closed unmerged 2026-09-13
+  # — this stack is ours alone again.
+  SHIM_TAG: v4.2.0-fix11649
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout kata-containers fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 || true
+          rustup default 1.96.0
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools clang llvm protobuf-compiler libseccomp-dev
+
+      - name: Verify fix15 patch is present
+        run: |
+          echo "Checking for fix15 idempotent blockdev-add / hotplug timeout (kata-containers#11649)"
+          grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          grep -n 'existing_block_hotplug' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          grep -n 'qmp_err_is_duplicate' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "Confirming NO other fix classes are carried (minimal overlay):"
+          ! grep -q 'start_mutex' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs || (echo "UNEXPECTED start_mutex present" && exit 1)
+          ! grep -q 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs || (echo "UNEXPECTED set_pdeathsig present" && exit 1)
+          echo "Checking for fix16 inotify close off tokio"
+          grep -n 'InotifyCloseOnThread\|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -10
+          echo "Checking for fix18/T16 missing-task Kill/Wait → stop_vm"
+          grep -n 'should_stop_vm_on_missing_task' src/runtime-rs/crates/runtimes/src/manager.rs src/runtime-rs/crates/runtimes/common/src/container_manager.rs
+          grep -n 'stop sandbox on missing-task kill' src/runtime-rs/crates/runtimes/src/manager.rs
+          grep -n 'missing-task Wait' src/runtime-rs/crates/runtimes/src/manager.rs
+          git log --oneline -1
+
+      - name: Generate config.rs
+        working-directory: src/runtime-rs
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          mkdir -p crates/shim/src
+          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.2.0";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
+          cat crates/shim/src/config.rs
+
+      - name: Build containerd-shim-kata-v2
+        working-directory: src/runtime-rs
+        run: |
+          set -eux
+          cargo build --release --target x86_64-unknown-linux-musl --bin containerd-shim-kata-v2
+          # Workspace cargo target-dir is the repo root (not src/runtime-rs/target).
+          BIN="../../target/x86_64-unknown-linux-musl/release/containerd-shim-kata-v2"
+          if [ ! -f "$BIN" ]; then
+            echo "ERROR: expected binary missing at $BIN; searching..."
+            find ../.. -name 'containerd-shim-kata-v2' -type f 2>/dev/null | head -10 || true
+            exit 1
+          fi
+          echo "Binary found at: $BIN"
+          cp "$BIN" ./containerd-shim-kata-v2
+          ls -la ./containerd-shim-kata-v2
+          sha256sum ./containerd-shim-kata-v2
+          file ./containerd-shim-kata-v2
+
+      - name: Stage binary and create overlay image
+        run: |
+          mkdir -p overlay-image
+          cp src/runtime-rs/containerd-shim-kata-v2 overlay-image/
+          cp tools/kubetee-shim-overlay/overlay.sh overlay-image/overlay.sh
+          chmod 755 overlay-image/overlay.sh
+          printf 'FROM alpine:3.22\nCOPY containerd-shim-kata-v2 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u pamanseau --password-stdin
+
+      - name: Build and push overlay image
+        run: |
+          docker buildx build --platform linux/amd64 \
+            -f overlay-image/Dockerfile \
+            -t ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} \
+            --push \
+            overlay-image/
+          echo "Pushed ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG}"
+
+      - name: Verify image
+        run: |
+          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} sha256sum /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 || true
+          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} grep -n fix11649 /overlay.sh | head -5
