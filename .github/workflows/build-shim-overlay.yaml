@@ -4,25 +4,28 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - kubetee-fix11649-only
+      - kubetee-fix11649-fix16
     paths:
       - 'src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs'
+      - 'src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs'
       - 'tools/kubetee-shim-overlay/**'
       - '.github/workflows/build-shim-overlay.yaml'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix1 (4.2.0 rebase): the full KubeTEE stack (QEMU start/stop serialization,
-  # tap EBUSY reclaim, PDEATHSIG, OS-thread reap, timed QMP connect,
-  # stop_vm_for_start_fail, try_lock stop, qemu_died fail-fast, fix15
-  # idempotent blockdev-add, fix16 inotify close-off-runtime, T15 sandbox-id
-  # Kill/Wait, T16 guest_map_is_empty ignoring the pause entry, fix22 no
-  # nvidia.com/nic CDI mapping) rebased onto kata 4.2.0 (c7351e797), keeping
-  # 4.2.0's fd-passing (#13546/#13548), console-watcher-before-start (#13437),
-  # and RLIMIT_MEMLOCK raise. All nine upstream PRs closed unmerged 2026-09-13
-  # — this stack is ours alone again.
-  SHIM_TAG: v4.2.0-fix11649
+  # fix11649+fix16 (4.2.0): stock 4.2.0 (c7351e797) + TWO fix classes only:
+  #  - fix15 (#11649): idempotent block hotplug / hotplug-sized QMP read
+  #    timeout in qmp.rs (deterministic duplicate drive-N CrashLoop on
+  #    every fetch-certs init recreate — reproduced 2026-09-17).
+  #  - fix16 (#13641): close inotify fds off the tokio runtime in
+  #    share_fs_volume.rs. RESTORED 2026-09-23: the 2026-09-17 A/B "moot"
+  #    verdict was falsified by a live repro (graceful teardown of a real
+  #    ~800Gi GPU-TDX guest wedged the shim: 2x D-state tokio-rt-worker
+  #    right after ConfigMap/projected-volume cleanup, pod Terminating
+  #    ~90 min, QEMU leaked with all 12 VFIO devices).
+  # All other fix classes stay OUT (A/B-verified moot on 4.2.0).
+  SHIM_TAG: v4.2.0-fix11649-fix16
 
 jobs:
   build-and-push:
@@ -47,13 +50,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools clang llvm protobuf-compiler libseccomp-dev
 
-      - name: Verify fix15 patch is present
+      - name: Verify fix15 + fix16 patches are present
         run: |
           echo "Checking for fix15 idempotent blockdev-add / hotplug timeout (kata-containers#11649)"
           grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
           grep -n 'existing_block_hotplug' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
           grep -n 'qmp_err_is_duplicate' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
-          echo "Confirming NO other fix classes are carried (minimal overlay):"
+          echo "Checking for fix16 inotify close off the tokio runtime (kata-containers#13641)"
+          grep -n 'InotifyCloseOnThread' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -5
+          grep -n 'kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -5
+          echo "Confirming NO other fix classes are carried (minimal overlay + fix16):"
           ! grep -q 'start_mutex' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs || (echo "UNEXPECTED start_mutex present" && exit 1)
           ! grep -q 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs || (echo "UNEXPECTED set_pdeathsig present" && exit 1)
           git log --oneline -1
