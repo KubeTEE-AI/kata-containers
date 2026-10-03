@@ -37,4 +37,31 @@ pub trait ContainerManager: Send + Sync {
     async fn pid(&self) -> Result<PID>;
     async fn need_shutdown_sandbox(&self, req: &ShutdownRequest) -> bool;
     async fn is_sandbox_container(&self, process_id: &ContainerProcess) -> bool;
+    async fn has_guest_container(&self, process_id: &ContainerProcess) -> bool;
+    async fn guest_map_is_empty(&self) -> bool;
+}
+
+/// Leftover Unknown init: kubelet StopContainer of a CRI id that never
+/// entered the shim map (e.g. `fetch-certs` after a node reboot). Wait
+/// then errors and never reaches sandbox-id Kill. An empty guest map
+/// (no workload containers; the pause/sandbox entry does not count —
+/// fix21) means only the pause/QEMU remain — safe to stop. Do **not**
+/// stop when another guest container is still in the map (init
+/// CrashLoop retry).
+pub fn should_stop_vm_on_missing_task(
+    is_sandbox: bool,
+    is_container_process: bool,
+    has_guest_container: bool,
+    guest_map_is_empty: bool,
+) -> bool {
+    // T15: containerd registers the sandbox/pause task with the QEMU pid.
+    // StopPodSandbox Kills that id; the shim has no guest container for it,
+    // so nobody would call stop() and Wait would block on the live QEMU.
+    if is_sandbox {
+        return true;
+    }
+    // T16: CRI Kills/Waits a container that never entered the shim map
+    // (leftover Unknown init after a node reboot). Only stop the VM when
+    // no guest workload container remains.
+    is_container_process && !has_guest_container && guest_map_is_empty
 }

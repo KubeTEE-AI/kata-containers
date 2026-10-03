@@ -9,18 +9,22 @@
 # The ONLY build artifact is the shim binary via upstream's shim-v2 recipe
 # (tools/packaging/static-build/shim-v2/Dockerfile dep list).
 #
-# Patch scope on branch kubetee-fix11649-4.3.1 (evidence-based per the
-# Phase 0.5b/0.5c battery on stock 4.3.1, 2026-10-22):
+# Patch scope on branch kubetee-fix11649-t15t16 (evidence-based per the
+# Phase 0.5b/0.5c battery on 4.3.1, 2026-10-22/23):
 #  - fix15 / kata-containers#11649: idempotent block hotplug +
-#    hotplug-sized QMP read timeout (qmp.rs) — REPRODUCED 4/4 on stock 4.3.1
+#    hotplug-sized QMP read timeout (qmp.rs) — REPRODUCED on stock 4.3.1
 #    (duplicate QEMU block device ID drive-5 after fetch-certs init unplug).
 #  - fix15-hardening: reclaim stale fdsets at hotplug (fdset_entry_is_stale
 #    classifier) — closes the remove_fd WouldBlock re-queue dead-end.
-#  - fix16 / #13641 and T15/T16 / #13665+#13746: CONSCIOUSLY DROPPED — the
-#    1201G GPU-TDX teardown battery reaped cleanly on stock 4.3.1 (no shim
-#    wedge, no leftover VM). Re-add as separate commits only on new evidence.
+#  - T15/T16 / #13665+#13746: stop_vm on missing-task Kill/Wait
+#    (should_stop_vm_on_missing_task + guest_map_is_empty) — REPRODUCED
+#    2026-10-23 (tq8bb: graceful delete wedged 105 min on fix11649; healthy
+#    shim, QEMU never signaled; unblocked only by kill -TERM <qemu>).
+#  - fix16 / #13641: CONSCIOUSLY DROPPED — not reproduced on 4.3.1 + kernel
+#    7.0.0-39 (the host-fsnotify confounder is fixed in 7.0.0-39). Re-add
+#    only on new evidence.
 #
-# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.3.1-fix11649 (NEW tag)
+# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.3.1-fix11649-t15t16 (NEW tag)
 
 name: build-shim-overlay
 
@@ -28,7 +32,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - kubetee-fix11649-4.3.1
+      - kubetee-fix11649-t15t16
     paths:
       - 'src/runtime-rs/**'
       - 'Cargo.lock'
@@ -46,7 +50,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  SHIM_TAG: v4.3.1-fix11649
+  SHIM_TAG: v4.3.1-fix11649-t15t16
   # Pin ONE exact toolchain for every step. rust-toolchain.toml only pins
   # `channel = "1.97"` (no patch), so `rustup target add` and `cargo build` can
   # resolve DIFFERENT 1.97.x toolchains — musl rust-std lands in one while the
@@ -76,13 +80,12 @@ jobs:
           if grep -nE 'InotifyCloseOnThread|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs; then
             echo "UNEXPECTED fix16 marker present"; exit 1
           fi
-          echo "== T15/T16 / kata-containers#13665+#13746 stop_vm (CONSCIOUSLY DROPPED — must be absent) =="
-          if grep -nE 'should_stop_vm_on_missing_task|guest_map_is_empty' \
-              src/runtime-rs/crates/runtimes/common/src/container_manager.rs \
-              src/runtime-rs/crates/runtimes/src/manager.rs \
-              src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs; then
-            echo "UNEXPECTED T15/T16 marker present"; exit 1
-          fi
+          echo "== T15/T16 / kata-containers#13665+#13746 stop_vm (REQUIRED) =="
+          grep -n 'should_stop_vm_on_missing_task' \
+            src/runtime-rs/crates/runtimes/common/src/container_manager.rs \
+            src/runtime-rs/crates/runtimes/src/manager.rs | head -5
+          grep -n 'guest_map_is_empty' \
+            src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs | head -5
           git log --oneline -3
 
       - name: Install build dependencies (upstream shim-v2 recipe + our extras)

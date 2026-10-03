@@ -8,10 +8,11 @@ use anyhow::{anyhow, Context, Result};
 use common::{
     config::load_config,
     message::{Action, Message},
+    should_stop_vm_on_missing_task,
     types::{
-        ContainerProcess, PlatformInfo, ProcessType, SandboxConfig, SandboxRequest,
-        SandboxResponse, SandboxStatusInfo, StartSandboxInfo, TaskRequest, TaskResponse,
-        DEFAULT_SHM_SIZE,
+        ContainerProcess, PlatformInfo, ProcessExitStatus, ProcessType, SandboxConfig,
+        SandboxRequest, SandboxResponse, SandboxStatusInfo, StartSandboxInfo, TaskRequest,
+        TaskResponse, DEFAULT_SHM_SIZE,
     },
     RuntimeHandler, RuntimeInstance, Sandbox, SandboxNetworkEnv,
 };
@@ -692,6 +693,30 @@ impl RuntimeHandlerManager {
             }
             TaskRequest::KillProcess(req) => {
                 cm.kill_process(&req).await.context("kill process")?;
+                // T15/T16: sandbox/pause id, or a leftover Unknown init CRI
+                // id that never entered the shim map (e.g. `fetch-certs`
+                // after a node reboot). Without this, StopPodSandbox waits
+                // forever on the live QEMU. An empty guest map means only
+                // the pause/QEMU remain (do not stop a live sibling guest).
+                let is_sandbox = cm.is_sandbox_container(&req.process).await;
+                let stop_vm = should_stop_vm_on_missing_task(
+                    is_sandbox,
+                    req.process.process_type == ProcessType::Container,
+                    cm.has_guest_container(&req.process).await,
+                    cm.guest_map_is_empty().await,
+                );
+                if stop_vm {
+                    info!(
+                        sl!(),
+                        "stopping VM on missing-task kill (sandbox: {}, container: {})",
+                        is_sandbox,
+                        req.process.container_id()
+                    );
+                    sandbox
+                        .stop()
+                        .await
+                        .context("stop sandbox on missing-task kill")?;
+                }
                 Ok(TaskResponse::KillProcess)
             }
             TaskRequest::ShutdownContainer(req) => {
@@ -711,8 +736,34 @@ impl RuntimeHandlerManager {
                 // treats the Wait reply as the exit, so for the sandbox
                 // container it must not run ahead of TaskExit, which a
                 // rootless or passthrough sandbox holds until its teardown.
-                let exit_status = cm.wait_process(&process_id).await.context("wait process")?;
-                if cm.is_sandbox_container(&process_id).await {
+                let is_sandbox = cm.is_sandbox_container(&process_id).await;
+                let stop_vm = should_stop_vm_on_missing_task(
+                    is_sandbox,
+                    process_id.process_type == ProcessType::Container,
+                    cm.has_guest_container(&process_id).await,
+                    cm.guest_map_is_empty().await,
+                );
+                let exit_status = match cm.wait_process(&process_id).await {
+                    Ok(status) => status,
+                    Err(err) if stop_vm => {
+                        // T15 / leftover Unknown init: the CRI task is not in
+                        // the guest map. Stop the VM and return a synthetic
+                        // 137 so StopContainer completes (fix18/20/21).
+                        warn!(
+                            sl!(),
+                            "wait missing task ({:#}); stopping VM with synthetic exit 137", err
+                        );
+                        sandbox
+                            .stop()
+                            .await
+                            .context("stop sandbox on missing-task wait")?;
+                        let mut status = ProcessExitStatus::new();
+                        status.update_exit_code(137);
+                        return Ok(TaskResponse::WaitProcess(status));
+                    }
+                    Err(err) => return Err(err).context("wait process"),
+                };
+                if is_sandbox {
                     sandbox.wait_exit_published().await;
                 }
                 Ok(TaskResponse::WaitProcess(exit_status))
