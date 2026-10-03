@@ -4,17 +4,21 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - kubetee-fix11649-fix16
+      - kubetee-fix11649-fix16-tx
     paths:
       - 'src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs'
       - 'src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs'
+      - 'src/runtime-rs/crates/runtimes/common/src/container_manager.rs'
+      - 'src/runtime-rs/crates/runtimes/common/src/lib.rs'
+      - 'src/runtime-rs/crates/runtimes/src/manager.rs'
+      - 'src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs'
       - 'tools/kubetee-shim-overlay/**'
       - '.github/workflows/build-shim-overlay.yaml'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix11649+fix16 (4.2.0): stock 4.2.0 (c7351e797) + TWO fix classes only:
+  # fix11649+fix16+T15/T16 (4.2.0): stock 4.2.0 (c7351e797) + THREE fix classes:
   #  - fix15 (#11649): idempotent block hotplug / hotplug-sized QMP read
   #    timeout in qmp.rs (deterministic duplicate drive-N CrashLoop on
   #    every fetch-certs init recreate — reproduced 2026-09-17).
@@ -24,8 +28,14 @@ env:
   #    ~800Gi GPU-TDX guest wedged the shim: 2x D-state tokio-rt-worker
   #    right after ConfigMap/projected-volume cleanup, pod Terminating
   #    ~90 min, QEMU leaked with all 12 VFIO devices).
+  #  - T15/T16 (#13665/#13746): stop_vm on missing-task Kill/Wait (sandbox-id
+  #    or leftover Unknown init; guest_map_is_empty ignores the pause entry).
+  #    RESTORED 2026-10-03: the 2026-09-17 "not reproducible on 4.2.0"
+  #    closures were falsified by TWO live repros the same day (fetch-certs
+  #    init Unknown after node reboot, StopPodSandbox wedged >30 min, only
+  #    kill -TERM <qemu> unblocked it; #13746 reopened).
   # All other fix classes stay OUT (A/B-verified moot on 4.2.0).
-  SHIM_TAG: v4.2.0-fix11649-fix16
+  SHIM_TAG: v4.2.0-fix11649-fix16-tx
 
 jobs:
   build-and-push:
@@ -59,7 +69,11 @@ jobs:
           echo "Checking for fix16 inotify close off the tokio runtime (kata-containers#13641)"
           grep -n 'InotifyCloseOnThread' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -5
           grep -n 'kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -5
-          echo "Confirming NO other fix classes are carried (minimal overlay + fix16):"
+          echo "Checking for T15/T16 missing-task stop_vm (kata-containers#13665/#13746)"
+          grep -n 'should_stop_vm_on_missing_task' src/runtime-rs/crates/runtimes/common/src/container_manager.rs | head -5
+          grep -n 'should_stop_vm_on_missing_task' src/runtime-rs/crates/runtimes/src/manager.rs | head -5
+          grep -n 'guest_map_is_empty' src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs | head -5
+          echo "Confirming NO other fix classes are carried (minimal overlay + fix16 + T15/T16):"
           ! grep -q 'start_mutex' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs || (echo "UNEXPECTED start_mutex present" && exit 1)
           ! grep -q 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs || (echo "UNEXPECTED set_pdeathsig present" && exit 1)
           git log --oneline -1
