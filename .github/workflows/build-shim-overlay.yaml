@@ -1,0 +1,174 @@
+# KubeTEE runtime-rs shim overlay image (4.3.1) — build + publish.
+#
+# The overlay scheme: upstream's official kata-deploy image is consumed
+# BYTE-PRISTINE (never rebuilt or repacked); a tiny sidecar DaemonSet copies
+# our patched containerd-shim-kata-v2 over the stock binary after kata-deploy
+# extracts it (tools/kubetee-shim-overlay/overlay.sh — cmp-based idempotent
+# copy + 60s watch loop).
+#
+# The ONLY build artifact is the shim binary via upstream's shim-v2 recipe
+# (tools/packaging/static-build/shim-v2/Dockerfile dep list).
+#
+# Patch scope on branch kubetee-fix11649-4.3.1 (evidence-based per the
+# Phase 0.5b/0.5c battery on stock 4.3.1, 2026-10-22):
+#  - fix15 / kata-containers#11649: idempotent block hotplug +
+#    hotplug-sized QMP read timeout (qmp.rs) — REPRODUCED 4/4 on stock 4.3.1
+#    (duplicate QEMU block device ID drive-5 after fetch-certs init unplug).
+#  - fix15-hardening: reclaim stale fdsets at hotplug (fdset_entry_is_stale
+#    classifier) — closes the remove_fd WouldBlock re-queue dead-end.
+#  - fix16 / #13641 and T15/T16 / #13665+#13746: CONSCIOUSLY DROPPED — the
+#    1201G GPU-TDX teardown battery reaped cleanly on stock 4.3.1 (no shim
+#    wedge, no leftover VM). Re-add as separate commits only on new evidence.
+#
+# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.3.1-fix11649 (NEW tag)
+
+name: build-shim-overlay
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - kubetee-fix11649-4.3.1
+    paths:
+      - 'src/runtime-rs/**'
+      - 'Cargo.lock'
+      - 'tools/kubetee-shim-overlay/**'
+      - '.github/workflows/build-shim-overlay.yaml'
+
+concurrency:
+  group: shim-overlay-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
+  SHIM_TAG: v4.3.1-fix11649
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Checkout kata-containers fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Patch marker gate (classes carried vs consciously dropped)
+        run: |
+          set -eux
+          echo "== fix15 / kata-containers#11649 idempotent block hotplug (REQUIRED) =="
+          grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          grep -n 'existing_block_hotplug' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          grep -n 'remove_fdset_ids' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "== fix15-hardening fdset reclaim (REQUIRED) =="
+          grep -n 'fdset_entry_is_stale' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "== classifier unit tests (REQUIRED) =="
+          grep -n 'mod tests_fix15' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "== fix16 / kata-containers#13641 inotify (CONSCIOUSLY DROPPED — must be absent) =="
+          if grep -nE 'InotifyCloseOnThread|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs; then
+            echo "UNEXPECTED fix16 marker present"; exit 1
+          fi
+          echo "== T15/T16 / kata-containers#13665+#13746 stop_vm (CONSCIOUSLY DROPPED — must be absent) =="
+          if grep -nE 'should_stop_vm_on_missing_task|guest_map_is_empty' \
+              src/runtime-rs/crates/runtimes/common/src/container_manager.rs \
+              src/runtime-rs/crates/runtimes/src/manager.rs \
+              src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs; then
+            echo "UNEXPECTED T15/T16 marker present"; exit 1
+          fi
+          git log --oneline -3
+
+      - name: Install build dependencies (upstream shim-v2 recipe + our extras)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential ca-certificates curl gcc git make cmake \
+            musl-tools protobuf-compiler clang llvm libseccomp-dev pkg-config
+          # musl-tools ships x86_64-linux-musl-gcc but NOT -g++; zlib-ng's cmake
+          # config (libz-sys, new in the 4.3.1 tree) references it — C-only lib.
+          sudo ln -sf /usr/bin/x86_64-linux-musl-gcc /usr/local/bin/x86_64-linux-musl-g++
+
+      - name: Install Rust toolchain (pinned 1.97 = rust-toolchain.toml at 4.3.1)
+        run: |
+          rustup toolchain install 1.97.0 || true
+          rustup default 1.97.0
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Classifier unit tests (qmp.rs tests_fix15*)
+        run: |
+          set -eux
+          cargo test -p hypervisor tests_fix15 -- --nocapture
+
+      - name: Generate config.rs (gitignored build-generated; stamp 4.3.1 + commit)
+        working-directory: src/runtime-rs
+        run: |
+          set -eux
+          COMMIT=$(git rev-parse HEAD)
+          mkdir -p crates/shim/src
+          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.3.1";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
+          cat crates/shim/src/config.rs
+
+      - name: Build containerd-shim-kata-v2 (static musl)
+        working-directory: src/runtime-rs
+        env:
+          RUSTUP_TOOLCHAIN: 1.97.0
+        run: |
+          set -eux
+          cargo build --release --target x86_64-unknown-linux-musl --bin containerd-shim-kata-v2
+          # Workspace cargo target-dir is the repo root (not src/runtime-rs/target).
+          BIN="../../target/x86_64-unknown-linux-musl/release/containerd-shim-kata-v2"
+          if [ ! -f "$BIN" ]; then
+            echo "ERROR: expected binary missing at $BIN; searching..."
+            find ../.. -name 'containerd-shim-kata-v2' -type f 2>/dev/null | head -10 || true
+            exit 1
+          fi
+          cp "$BIN" ./containerd-shim-kata-v2
+          sha256sum ./containerd-shim-kata-v2
+          file ./containerd-shim-kata-v2
+
+      - name: Stage binary and create overlay image
+        run: |
+          set -eux
+          mkdir -p overlay-image
+          cp src/runtime-rs/containerd-shim-kata-v2 overlay-image/
+          cp tools/kubetee-shim-overlay/overlay.sh overlay-image/overlay.sh
+          chmod 755 overlay-image/overlay.sh
+          printf 'FROM alpine:3.22\nCOPY containerd-shim-kata-v2 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push overlay image
+        run: |
+          set -eux
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG}"
+          docker buildx build --platform linux/amd64 \
+            -f overlay-image/Dockerfile \
+            --provenance false --sbom false \
+            -t "${IMAGE_REF}" \
+            --push \
+            overlay-image/
+          echo "Pushed ${IMAGE_REF}"
+
+      - name: Verify image (shim sha + overlay marker)
+        env:
+          IMAGE_REF: ghcr.io/kubetee-ai/kata-deploy-shim-overlay
+        run: |
+          set -eux
+          IMG="${IMAGE_REF}:${SHIM_TAG}"
+          docker pull -q "${IMG}"
+          docker run --rm "${IMG}" sha256sum /opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+          docker run --rm "${IMG}" grep -n fix11649 /overlay.sh | head -5
+          echo "== image manifest digest (digest-pin this in the Fleet daemonset) =="
+          docker buildx imagetools inspect "${IMG}" | head -4
+          {
+            echo "## shim overlay ${SHIM_TAG}"
+            echo '- shim sha256: see `sha256sum` line above (pin in the CC post-reboot checklist)'
+            echo '```'
+            docker buildx imagetools inspect "${IMG}" | head -4
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
