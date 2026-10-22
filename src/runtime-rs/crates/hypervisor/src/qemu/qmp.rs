@@ -1182,6 +1182,11 @@ impl Qmp {
                     node_name,
                     e
                 );
+            } else {
+                // fix15-hardening: the orphan is gone — its fdsets went with it.
+                // Drop the tracking entry (removal failures are re-queued) so the
+                // duplicate guard below cannot dead-end on bookkeeping alone.
+                self.remove_block_fdsets(&node_name);
             }
         }
 
@@ -1383,9 +1388,29 @@ impl Qmp {
             return Ok(existing);
         }
         if self.block_fdsets.contains_key(&node_name) {
-            // fdsets tracked for this node imply a live prior hotplug attempt
-            // (4.2.0 fd-passing bookkeeping) — treat as duplicate device ID.
-            return Err(anyhow!("duplicate QEMU block device ID {node_name}"));
+            // fix15-hardening (kata-containers#11649): a tracked fdset entry is
+            // only a live duplicate while a matching block node or qdev exists in
+            // QEMU. After a WouldBlock-interrupted cleanup the entry can outlive
+            // both (remove_fdset_ids re-queues removal failures under the same
+            // name), which dead-ends every retry at this guard even though QEMU
+            // is clean. Reclaim the stale bookkeeping instead: re-drive removal
+            // best-effort and let the fresh registration own the name.
+            if !fdset_entry_is_stale(
+                self.block_node_exists(&node_name),
+                self.get_device_by_qdev_id(&node_name).is_ok(),
+            ) {
+                return Err(anyhow!("duplicate QEMU block device ID {node_name}"));
+            }
+            warn!(
+                sl!(),
+                "hotplug_block_device(): reclaiming stale fdsets for {} (no live node or qdev) (fix15-hardening)",
+                node_name
+            );
+            let stale = self.block_fdsets.remove(&node_name).unwrap_or_default();
+            self.remove_fdset_ids(&node_name, stale);
+            // remove_fdset_ids re-queues any removal that still WouldBlocks; the
+            // fresh registration below owns this name now, so drop the leftovers.
+            self.block_fdsets.remove(&node_name);
         }
         let discard_option = || discard_unmap.then_some(BlockdevDiscardOptions::unmap);
 
@@ -2049,6 +2074,15 @@ fn qmp_err_is_timeout(msg: &str) -> bool {
         || m.contains("resource temporarily unavailable")
 }
 
+/// fix15-hardening (kata-containers#11649): decide what a tracked block fdset
+/// entry means at hotplug time. With no live QEMU block node and no live qdev
+/// carrying the name, the entry is stale bookkeeping left by a
+/// WouldBlock-interrupted cleanup and must be reclaimed, not rejected. A live
+/// node or device is a genuine duplicate.
+fn fdset_entry_is_stale(node_live: bool, device_live: bool) -> bool {
+    !(node_live || device_live)
+}
+
 #[cfg(test)]
 mod tests_fix15 {
     use super::{qmp_err_is_duplicate, qmp_err_is_timeout};
@@ -2070,5 +2104,32 @@ mod tests_fix15 {
             r#"Io(Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" })"#
         ));
         assert!(!qmp_err_is_timeout("GenericError"));
+    }
+}
+
+#[cfg(test)]
+mod tests_fix15_hardening {
+    use super::fdset_entry_is_stale;
+
+    #[test]
+    fn stale_when_no_live_node_and_no_live_qdev() {
+        // The 2026-10-22 deadlock signature: entry re-queued by a WouldBlock
+        // remove_fdset_ids run, retry arrives, QEMU verified clean.
+        assert!(fdset_entry_is_stale(false, false));
+    }
+
+    #[test]
+    fn live_node_is_a_genuine_duplicate() {
+        assert!(!fdset_entry_is_stale(true, false));
+    }
+
+    #[test]
+    fn live_qdev_is_a_genuine_duplicate() {
+        assert!(!fdset_entry_is_stale(false, true));
+    }
+
+    #[test]
+    fn both_live_is_a_genuine_duplicate() {
+        assert!(!fdset_entry_is_stale(true, true));
     }
 }
