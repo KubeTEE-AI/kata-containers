@@ -42,9 +42,15 @@ FROM rust:1.97-slim AS shim-build
 # the one `rustup target add` installed musl rust-std into, which fails the
 # build with E0463: can't find crate for `core`.
 ENV RUSTUP_TOOLCHAIN=1.97.0
+# cmake: libz-sys builds zlib-ng via cmake (panics without it). musl-tools ships
+# x86_64-linux-musl-gcc but NOT -g++; the cc crate probes for the CXX name and
+# zlib-ng's cmake config references it — symlink it to the musl gcc driver
+# (zlib-ng is C-only; the CXX driver is never actually invoked).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools clang llvm protobuf-compiler libseccomp-dev pkg-config \
+        cmake g++ \
         ca-certificates \
+    && ln -s /usr/bin/x86_64-linux-musl-gcc /usr/local/bin/x86_64-linux-musl-g++ \
     && rustup show active-toolchain \
     && rustup target add x86_64-unknown-linux-musl \
     && rm -rf /var/lib/apt/lists/*
