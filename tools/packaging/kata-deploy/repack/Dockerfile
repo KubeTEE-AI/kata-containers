@@ -29,6 +29,10 @@
 
 ARG BASE_IMAGE=quay.io/kata-containers/kata-deploy@sha256:799c17dcbd6f2c93f2c84f69667aa74b250ce91986096cc990a12abfc8871799
 
+# Named stage for the upstream base: COPY --from= does not support variable
+# expansion, so the base image is referenced through this stage name.
+FROM ${BASE_IMAGE} AS upstream-base
+
 # --- Stage 1: build the patched runtime-rs shim ------------------------------
 FROM rust:1.97-slim AS shim-build
 # Toolchain 1.97 = versions.yaml / rust-toolchain.toml at 4.3.1.
@@ -63,7 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends zstd tar findut
     && rm -rf /var/lib/apt/lists/*
 ARG BASE_IMAGE
 ARG KATA_GIT_COMMIT=unknown
-COPY --from=${BASE_IMAGE} /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst /opt/kata-artifacts/tarballs/
+COPY --from=upstream-base /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst /opt/kata-artifacts/tarballs/
 COPY --from=shim-build /src/target/x86_64-unknown-linux-musl/release/containerd-shim-kata-v2 /tmp/kubetee-containerd-shim-kata-v2
 # Swap ONLY ./opt/kata/runtime-rs/bin/containerd-shim-kata-v2 (mode 0755); every
 # other entry in the tarball — including all runtime-rs config TOMLs — passes
@@ -75,7 +79,7 @@ RUN set -eux; \
     zstd -dc /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst | tar -xf - -C t/keep; \
     cp /tmp/kubetee-containerd-shim-kata-v2 t/keep/opt/kata/runtime-rs/bin/containerd-shim-kata-v2; \
     chmod 0755 t/keep/opt/kata/runtime-rs/bin/containerd-shim-kata-v2; \
-    (cd t/keep && find ./opt \( -type f -o -type l \) | LC_ALL=C sort | tar -cf - -T -) > t/shim-v2-rust.tar; \
+    (cd t/keep && find ./opt | LC_ALL=C sort | tar -cf - -T -) > t/shim-v2-rust.tar; \
     zstd -q -19 -o /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst.new t/shim-v2-rust.tar; \
     mv /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst.new /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst; \
     SHIM_SHA256="$(sha256sum /tmp/kubetee-containerd-shim-kata-v2 | awk '{print $1}')"; \
@@ -93,8 +97,8 @@ RUN set -eux; \
     cat /opt/kata-artifacts/kubetee-repack-info.txt
 
 # --- Stage 3: upstream image + the two changed files -------------------------
-# Distroless base: COPY only, no RUN. The rest of the image layers are
-# inherited unchanged from the pinned upstream base.
-FROM ${BASE_IMAGE}
+# Distroless base: COPY only, no RUN. The rest of the image layers (and the
+# image config — ENTRYPOINT etc.) are inherited unchanged from upstream-base.
+FROM upstream-base
 COPY --from=repack /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst /opt/kata-artifacts/tarballs/kata-static-shim-v2-rust.tar.zst
 COPY --from=repack /opt/kata-artifacts/kubetee-repack-info.txt /opt/kata-artifacts/kubetee-repack-info.txt
