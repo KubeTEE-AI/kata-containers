@@ -35,10 +35,17 @@ FROM ${BASE_IMAGE} AS upstream-base
 
 # --- Stage 1: build the patched runtime-rs shim ------------------------------
 FROM rust:1.97-slim AS shim-build
-# Toolchain 1.97 = versions.yaml / rust-toolchain.toml at 4.3.1.
+# Toolchain 1.97.0 = versions.yaml / rust-toolchain.toml at 4.3.1. Pin the exact
+# patch version via RUSTUP_TOOLCHAIN (outranks the tree's rust-toolchain.toml):
+# with only the file's `channel = "1.97"` spec, the rustup shim re-resolves the
+# toolchain when cargo runs from /src — potentially a different toolchain than
+# the one `rustup target add` installed musl rust-std into, which fails the
+# build with E0463: can't find crate for `core`.
+ENV RUSTUP_TOOLCHAIN=1.97.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools clang llvm protobuf-compiler libseccomp-dev pkg-config \
         ca-certificates \
+    && rustup show active-toolchain \
     && rustup target add x86_64-unknown-linux-musl \
     && rm -rf /var/lib/apt/lists/*
 
