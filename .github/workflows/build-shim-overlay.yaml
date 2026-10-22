@@ -47,6 +47,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
   SHIM_TAG: v4.3.1-fix11649
+  # Pin ONE exact toolchain for every step. rust-toolchain.toml only pins
+  # `channel = "1.97"` (no patch), so `rustup target add` and `cargo build` can
+  # resolve DIFFERENT 1.97.x toolchains — musl rust-std lands in one while the
+  # build uses the other -> E0463: can't find crate for `core`. RUSTUP_TOOLCHAIN
+  # (highest precedence) forces one toolchain everywhere.
+  RUSTUP_TOOLCHAIN: 1.97.0
 
 jobs:
   build-and-push:
@@ -110,8 +116,6 @@ jobs:
 
       - name: Build containerd-shim-kata-v2 (static musl)
         working-directory: src/runtime-rs
-        env:
-          RUSTUP_TOOLCHAIN: 1.97.0
         run: |
           set -eux
           cargo build --release --target x86_64-unknown-linux-musl --bin containerd-shim-kata-v2
