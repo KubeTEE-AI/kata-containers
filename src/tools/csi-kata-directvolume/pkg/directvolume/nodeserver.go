@@ -120,13 +120,21 @@ func (dv *directVolume) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, status.Error(codes.Aborted, errMsg)
 	}
 
-	// kata-containers DirectVolume add
+	// kata-containers DirectVolume add.
+	//
+	// The "options" slice above is for the host-side CSI bind-mount
+	// only — it always contains "bind" plus "ro"/"rw". Forwarding it
+	// to kata-agent is wrong: kata-agent calls parse_mount_options(),
+	// which turns "bind" into MS_BIND, and mount(2) with MS_BIND on a
+	// block device is rejected by the kernel (see #11296). Send no
+	// options here; the in-guest mount is a plain fsType mount of the
+	// attached block device. (from PR #13185)
 	mountInfo := utils.MountInfo{
 		VolumeType: volType,
 		Device:     devicePath,
 		FsType:     fsType,
 		Metadata:   attrib,
-		Options:    options,
+		Options:    nil,
 	}
 	if err := utils.AddDirectVolume(targetPath, mountInfo); err != nil {
 		klog.Errorf("add direct volume with source %s and mountInfo %v failed", targetPath, mountInfo)
@@ -281,11 +289,8 @@ func (dv *directVolume) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnst
 		}
 	}
 
-	// NB: do not delete the raw disk here. The CSI spec reserves backing
-	// storage teardown for ControllerDeleteVolume; deleting it on
-	// NodeUnstage makes the volume effectively ephemeral, ignoring
-	// reclaimPolicy: Retain and losing any data the workload wrote.
-
+	// The raw disk is allocated by CreateVolume and released by
+	// DeleteVolume; unstaging only undoes the node-local staging.
 	if err := os.RemoveAll(stagingTargetPath); err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("remove staging target path: %v", err))
 	}
@@ -421,11 +426,9 @@ func (dv *directVolume) stageSPDKVolume(req *csi.NodeStageVolumeRequest, volumeI
 }
 
 func (dv *directVolume) stageDirectVolume(req *csi.NodeStageVolumeRequest, volumeID string) (*csi.NodeStageVolumeResponse, error) {
-	capacityInBytes := req.VolumeContext[utils.CapabilityInBytes]
-	devicePath, err := utils.CreateDirectBlockDevice(volumeID, capacityInBytes, dv.config.StoragePath)
+	devicePath, err := dv.directBackingDevice(req, volumeID)
 	if err != nil {
-		errMsg := status.Errorf(codes.Internal, "setup storage for volume '%s' failed", volumeID)
-		return &csi.NodeStageVolumeResponse{}, errMsg
+		return nil, err
 	}
 
 	// /full_path_on_host/VolumeId/
@@ -488,6 +491,30 @@ func (dv *directVolume) stageDirectVolume(req *csi.NodeStageVolumeRequest, volum
 	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// directBackingDevice returns the raw disk that CreateVolume allocated for the
+// volume. A recorded raw disk that is missing is an error: recreating it would
+// hand the workload an empty filesystem in place of its data.
+func (dv *directVolume) directBackingDevice(req *csi.NodeStageVolumeRequest, volumeID string) (*string, error) {
+	if vol, err := dv.state.GetVolumeByID(volumeID); err == nil {
+		if backingFile := vol.Metadata["backingFile"]; backingFile != "" {
+			if _, err := os.Stat(backingFile); err != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "backing device %s of volume %s is not available: %v", backingFile, volumeID, err)
+			}
+			return &backingFile, nil
+		}
+	}
+
+	// Volumes provisioned by older driver versions have no recorded raw
+	// disk, as it was allocated here on every stage.
+	klog.Warningf("volume %s has no recorded backing device, allocating it on stage", volumeID)
+	devicePath, err := utils.CreateDirectBlockDevice(volumeID, req.VolumeContext[utils.CapabilityInBytes], dv.config.StoragePath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "setup storage for volume '%s' failed: %v", volumeID, err)
+	}
+
+	return devicePath, nil
 }
 
 func controllerExists(name string, resp interface{}) bool {
