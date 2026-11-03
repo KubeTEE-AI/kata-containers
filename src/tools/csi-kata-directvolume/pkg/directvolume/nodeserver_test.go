@@ -192,3 +192,59 @@ func TestSPDKStage(t *testing.T) {
 	require.Contains(t, callsJoined.String(), "vhost_get_controllers",
 		"should call vhost_get_controllers at least once")
 }
+
+
+func TestNodePublishVolumeMissingState(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	dv, err := NewDirectVolumeDriver(cfg)
+	require.NoError(t, err)
+
+	_, err = dv.NodePublishVolume(context.TODO(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "00000000-0000-0000-0000-000000000000",
+		TargetPath:       filepath.Join(t.TempDir(), "target"),
+		VolumeCapability: mountCap(),
+		VolumeContext: map[string]string{
+			utils.IsDirectVolume:                 "True",
+			utils.KataContainersDirectVolumeType: utils.DirectVolumeTypeName,
+		},
+	})
+	require.Equal(t, codes.NotFound, status.Code(err))
+}
+
+func TestStageDirectVolumeMissingBackingDevice(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := testConfig(tmp)
+	dv, err := NewDirectVolumeDriver(cfg)
+	require.NoError(t, err)
+
+	createResp, err := dv.CreateVolume(context.TODO(), &csi.CreateVolumeRequest{
+		Name: "vol-direct",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 8 << 20,
+		},
+		Parameters: map[string]string{
+			utils.KataContainersDirectVolumeType: utils.DirectVolumeTypeName,
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{mountCap()},
+	})
+	require.NoError(t, err)
+	volID := createResp.GetVolume().GetVolumeId()
+	req := &csi.NodeStageVolumeRequest{
+		VolumeId:          volID,
+		StagingTargetPath: filepath.Join(tmp, "stage", volID),
+		VolumeCapability:  mountCap(),
+		VolumeContext:     createResp.GetVolume().GetVolumeContext(),
+	}
+
+	// Staging must not replace a lost backing device with an empty one.
+	require.NoError(t, os.RemoveAll(filepath.Join(cfg.StoragePath, volID)))
+	_, err = dv.NodeStageVolume(context.TODO(), req)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	_, err = os.Stat(filepath.Join(cfg.StoragePath, volID))
+	require.True(t, os.IsNotExist(err))
+
+	req.VolumeId = "00000000-0000-0000-0000-000000000000"
+	_, err = dv.NodeStageVolume(context.TODO(), req)
+	require.Equal(t, codes.NotFound, status.Code(err))
+}
+
