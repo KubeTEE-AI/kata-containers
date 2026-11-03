@@ -32,8 +32,8 @@ const (
 )
 
 const (
-	CapabilityInBytes = "capacity_in_bytes"
-	DirectVolumeName  = "direct_volume_name"
+	CapacityInBytes  = "capacity_in_bytes"
+	DirectVolumeName = "direct_volume_name"
 )
 
 const PERM os.FileMode = 0750

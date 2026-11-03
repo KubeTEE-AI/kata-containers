@@ -91,6 +91,19 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 			}
 		}
 
+<<<<<<< HEAD
+=======
+		// A retried CreateVolume may follow a failure between recording the
+		// volume and allocating its backing device, so allocate again.
+		if volumeCtx[utils.KataContainersDirectVolumeType] != utils.SpdkVolumeTypeName {
+			if err := dv.ensureDirectBackingDevice(&exVol); err != nil {
+				return nil, err
+			}
+		}
+
+		volumeCtx[utils.CapacityInBytes] = fmt.Sprintf("%d", exVol.VolSize)
+
+>>>>>>> 8eb0307e5 (csi-kata-directvolume: fix a constant name)
 		return &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
 				VolumeId:           exVol.VolID,
@@ -145,7 +158,7 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 	}
 
 	volumeCtx[utils.DirectVolumeName] = req.GetName()
-	volumeCtx[utils.CapabilityInBytes] = fmt.Sprintf("%d", capacity)
+	volumeCtx[utils.CapacityInBytes] = fmt.Sprintf("%d", capacity)
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
