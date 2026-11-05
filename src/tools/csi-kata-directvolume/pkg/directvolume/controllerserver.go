@@ -201,6 +201,7 @@ func (dv *directVolume) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeR
 		msg := fmt.Sprintf("Volume '%s' is still used (attached: %v, staged: %v, published: %v) by '%s' node",
 			vol.VolID, vol.Attached, vol.Staged, vol.Published, vol.NodeID)
 		klog.Warning(msg)
+		return nil, status.Error(codes.FailedPrecondition, msg)
 	}
 
 	if vol.Metadata["type"] == utils.SpdkVolumeTypeName {
