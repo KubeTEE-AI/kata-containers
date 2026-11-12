@@ -9,7 +9,7 @@
 # The ONLY build artifact is the shim binary via upstream's shim-v2 recipe
 # (tools/packaging/static-build/shim-v2/Dockerfile dep list).
 #
-# Patch scope on branch kubetee-fix11649-t15t16 (evidence-based per the
+# Patch scope on this branch (evidence-based per the
 # Phase 0.5b/0.5c battery on 4.3.1, 2026-10-22/23):
 #  - fix15 / kata-containers#11649: idempotent block hotplug +
 #    hotplug-sized QMP read timeout (qmp.rs) — REPRODUCED on stock 4.3.1
@@ -24,15 +24,21 @@
 #    7.0.0-39 (the host-fsnotify confounder is fixed in 7.0.0-39). Re-add
 #    only on new evidence.
 #
-# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.3.1-fix11649-t15t16 (NEW tag)
+# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.3.1-lifecycle-c1-20261112 (NEW tag)
 
 name: build-shim-overlay
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: New immutable candidate tag; never reuse a published tag
+        required: true
+        default: v4.3.1-lifecycle-c1-20261112
+        type: string
   push:
     branches:
-      - kubetee-fix11649-t15t16
+      - kubetee-shim-candidate-lifecycle-min
     paths:
       - 'src/runtime-rs/**'
       - 'Cargo.lock'
@@ -50,7 +56,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  SHIM_TAG: v4.3.1-fix11649-t15t16
+  SHIM_TAG: ${{ inputs.tag || 'v4.3.1-lifecycle-c1-20261112' }}
   # Pin ONE exact toolchain for every step. rust-toolchain.toml only pins
   # `channel = "1.97"` (no patch), so `rustup target add` and `cargo build` can
   # resolve DIFFERENT 1.97.x toolchains — musl rust-std lands in one while the
@@ -103,9 +109,11 @@ jobs:
           rustup default 1.97.0
           rustup target add x86_64-unknown-linux-musl
 
-      - name: Classifier unit tests (qmp.rs tests_fix15*)
+      - name: Runtime cleanup and fix15 unit tests
+        working-directory: src/runtime-rs
         run: |
           set -eux
+          cargo test -p virt-container container_manager -- --nocapture
           cargo test -p hypervisor tests_fix15 -- --nocapture
 
       - name: Generate config.rs (gitignored build-generated; stamp 4.3.1 + commit)
@@ -142,10 +150,20 @@ jobs:
           chmod 755 overlay-image/overlay.sh
           printf 'FROM alpine:3.22\nCOPY containerd-shim-kata-v2 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2\nCOPY overlay.sh /overlay.sh\nRUN chmod 755 /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 /overlay.sh\nCMD ["/bin/sh", "/overlay.sh"]\n' > overlay-image/Dockerfile
 
-      - name: Log in to GHCR
+      - name: Log in to GHCR and require a new immutable tag
         env:
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        run: echo "$GH_TOKEN" | docker login ghcr.io -u pamanseau --password-stdin
+        run: |
+          set -eux
+          echo "$GH_TOKEN" | docker login ghcr.io -u pamanseau --password-stdin
+          if [[ ! "$SHIM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid release tag: $SHIM_TAG"; exit 1
+          fi
+          gh api '/user/packages/container/kata-deploy-shim-overlay/versions?per_page=100' \
+            --paginate --jq '.[].metadata.container.tags[]' > existing-tags
+          if grep -Fxq "$SHIM_TAG" existing-tags; then
+            echo "Tag already exists: $SHIM_TAG. Choose a new tag; never reuse one."; exit 1
+          fi
 
       - name: Build and push overlay image
         run: |
