@@ -39,11 +39,6 @@ const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
 const DEFAULT_QMP_INIT_READ_TIMEOUT: u64 = 5000;
 const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
 const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
-/// fix15 (kata-containers#11649): blockdev-add of a multi-layer EROFS VMDK can
-/// exceed 250ms. SO_RCVTIMEO then returns EAGAIN (WouldBlock) after QEMU has
-/// already created the node, and the CreateContainer retry hits
-/// "Duplicate nodes drive-N". Keep the hotplug-sized read timeout.
-const DEFAULT_QMP_HOTPLUG_READ_TIMEOUT: u64 = 60_000;
 
 const DEVICE_DELETED_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1113,112 +1108,8 @@ impl Qmp {
         Err(anyhow!("no target device found"))
     }
 
-    /// fix15 (kata-containers#11649): set the QMP read timeout. The 250ms
-    /// default is too small for multi-layer EROFS VMDK blockdev-add, which
-    /// then fails WouldBlock after QEMU already created the node.
-    fn set_qmp_read_timeout(&mut self, timeout: Duration) {
-        if let Err(e) = self
-            .qmp
-            .inner_mut()
-            .get_mut_write()
-            .set_read_timeout(Some(timeout))
-        {
-            warn!(sl!(), "Failed to set QMP read timeout {:?}: {:?}", timeout, e);
-        }
-    }
-
-    /// fix15: query QEMU whether a blockdev node with this name exists.
-    fn block_node_exists(&mut self, node_name: &str) -> bool {
-        match self
-            .qmp
-            .execute(&qapi_qmp::query_named_block_nodes { flat: Some(true) })
-        {
-            Ok(nodes) => nodes
-                .iter()
-                .any(|d| d.node_name.as_deref() == Some(node_name)),
-            Err(e) => {
-                warn!(
-                    sl!(),
-                    "query_named_block_nodes failed while checking {}: {:?}", node_name, e
-                );
-                false
-            }
-        }
-    }
-
-    /// fix15: if a previous hotplug already created this node (timeout race
-    /// or an unplug that removed the frontend but left the backend), return
-    /// the existing device or delete the orphaned backend before retrying.
-    fn existing_block_hotplug(
-        &mut self,
-        block_driver: &str,
-        index: u64,
-    ) -> Result<Option<(Option<PciPath>, Option<String>)>> {
-        let node_name = block_node_name(index);
-        let node_exists = self.block_node_exists(&node_name);
-        let device_exists = self.get_device_by_qdev_id(&node_name).is_ok();
-
-        if node_exists && device_exists {
-            info!(
-                sl!(),
-                "hotplug_block_device(): {} already attached, treating as success (fix15)",
-                node_name
-            );
-            return Ok(Some(self.block_hotplug_result(block_driver, index, &node_name)?));
-        }
-
-        if node_exists && !device_exists {
-            warn!(
-                sl!(),
-                "hotplug_block_device(): orphaned backend {}, deleting before retry (fix15)",
-                node_name
-            );
-            if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_del {
-                node_name: node_name.clone(),
-            }) {
-                warn!(
-                    sl!(),
-                    "hotplug_block_device(): blockdev_del of orphan {} failed: {:?}",
-                    node_name,
-                    e
-                );
-            } else {
-                // fix15-hardening: the orphan is gone — its fdsets went with it.
-                // Drop the tracking entry (removal failures are re-queued) so the
-                // duplicate guard below cannot dead-end on bookkeeping alone.
-                self.remove_block_fdsets(&node_name);
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// fix15: derive the hotplug result for an already-attached device.
-    fn block_hotplug_result(
-        &mut self,
-        block_driver: &str,
-        index: u64,
-        node_name: &str,
-    ) -> Result<(Option<PciPath>, Option<String>)> {
-        if block_driver == VIRTIO_SCSI {
-            let index_u16 = u16::try_from(index)?;
-            let scsi_id = (index_u16 >> 8) as u8;
-            let lun = (index_u16 & 0xFF) as u8;
-            Ok((None, Some(format!("{scsi_id}:{lun}"))))
-        } else if block_driver == VIRTIO_BLK_CCW {
-            Ok((None, Some(node_name.to_string())))
-        } else {
-            let pci_path = self
-                .get_device_by_qdev_id(node_name)
-                .context("get device by qdev_id failed")?;
-            Ok((Some(pci_path), None))
-        }
-    }
-
     /// Execute device_add for a block device. On failure, automatically
     /// rolls back the blockdev node added earlier to avoid orphaned resources.
-    /// Timeout / Duplicate must not roll back — QEMU may already own the node
-    /// (kata-containers#11649 / fix15).
     fn device_add_with_rollback(
         &mut self,
         node_name: &str,
@@ -1232,31 +1123,6 @@ impl Qmp {
             driver: driver.to_owned(),
             arguments,
         }) {
-            let msg = format!("{e:?}");
-            if qmp_err_is_duplicate(&msg) {
-                info!(
-                    sl!(),
-                    "device_add_with_rollback(): {} already present, treating as success (fix15)",
-                    node_name
-                );
-                return Ok(());
-            }
-            if qmp_err_is_timeout(&msg) && self.get_device_by_qdev_id(node_name).is_ok() {
-                warn!(
-                    sl!(),
-                    "device_add_with_rollback(): {} timed out but frontend exists (fix15)",
-                    node_name
-                );
-                return Ok(());
-            }
-            if qmp_err_is_timeout(&msg) {
-                warn!(
-                    sl!(),
-                    "device_add_with_rollback(): {} timed out; leaving backend (fix15)",
-                    node_name
-                );
-                return Err(anyhow!("device_add {:?}", e));
-            }
             if let Err(blockdev_err) = self.qmp.execute(&qapi_qmp::blockdev_del {
                 node_name: node_name.to_owned(),
             }) {
@@ -1362,42 +1228,8 @@ impl Qmp {
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = block_node_name(index);
-        // fix15: raise the QMP read timeout for the hotplug — a multi-layer
-        // EROFS VMDK blockdev-add can exceed the 250ms default SO_RCVTIMEO,
-        // which returns EAGAIN after QEMU already created the node. The
-        // CreateContainer retry then hits "Duplicate nodes drive-N"
-        // (kata-containers#11649).
-        self.set_qmp_read_timeout(Duration::from_millis(DEFAULT_QMP_HOTPLUG_READ_TIMEOUT));
-        // fix15: if a previous hotplug already created this node (timeout race
-        // or orphaned backend left by an unplug that only removed the frontend),
-        // clean it up or return the existing device instead of failing.
-        if let Some(existing) = self.existing_block_hotplug(block_driver, index)? {
-            return Ok(existing);
-        }
         if self.block_fdsets.contains_key(&node_name) {
-            // fix15-hardening (kata-containers#11649): a tracked fdset entry is
-            // only a live duplicate while a matching block node or qdev exists in
-            // QEMU. After a WouldBlock-interrupted cleanup the entry can outlive
-            // both (remove_fdset_ids re-queues removal failures under the same
-            // name), which dead-ends every retry at this guard even though QEMU
-            // is clean. Reclaim the stale bookkeeping instead: re-drive removal
-            // best-effort and let the fresh registration own the name.
-            if !fdset_entry_is_stale(
-                self.block_node_exists(&node_name),
-                self.get_device_by_qdev_id(&node_name).is_ok(),
-            ) {
-                return Err(anyhow!("duplicate QEMU block device ID {node_name}"));
-            }
-            warn!(
-                sl!(),
-                "hotplug_block_device(): reclaiming stale fdsets for {} (no live node or qdev) (fix15-hardening)",
-                node_name
-            );
-            let stale = self.block_fdsets.remove(&node_name).unwrap_or_default();
-            self.remove_fdset_ids(&node_name, stale);
-            // remove_fdset_ids re-queues any removal that still WouldBlocks; the
-            // fresh registration below owns this name now, so drop the leftovers.
-            self.block_fdsets.remove(&node_name);
+            return Err(anyhow!("duplicate QEMU block device ID {node_name}"));
         }
         let discard_option = || discard_unmap.then_some(BlockdevDiscardOptions::unmap);
 
@@ -1514,24 +1346,9 @@ impl Qmp {
             self.block_fdsets.insert(node_name.clone(), fdset_ids);
         }
 
-        if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_add(blockdev_options)) {
-            let msg = format!("{e:?}");
-            if qmp_err_is_duplicate(&msg) {
-                warn!(
-                    sl!(),
-                    "hotplug_block_device(): {} already present, continuing (fix15)",
-                    node_name
-                );
-            } else if qmp_err_is_timeout(&msg) && self.block_node_exists(&node_name) {
-                warn!(
-                    sl!(),
-                    "hotplug_block_device(): {} timed out but node exists, continuing (fix15)",
-                    node_name
-                );
-            } else {
-                self.remove_block_fdsets(&node_name);
-                return Err(anyhow!("blockdev-add backend {:?}", e));
-            }
+        if let Err(err) = self.qmp.execute(&qapi_qmp::blockdev_add(blockdev_options)) {
+            self.remove_block_fdsets(&node_name);
+            return Err(anyhow!("blockdev-add backend {:?}", err));
         }
 
         // block device
@@ -2319,81 +2136,5 @@ mod tests {
             fake.commands(),
             ["qom-list", "blockdev-del", "query-named-block-nodes"]
         );
-    }
-}
-
-/// fix15 (kata-containers#11649): classify QMP backend errors that indicate
-/// QEMU already owns the node rather than a hard failure.
-fn qmp_err_is_duplicate(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("duplicate nodes") || m.contains("is in use")
-}
-
-/// fix15: classify SO_RCVTIMEO / poll expirations that raced a successful add.
-fn qmp_err_is_timeout(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("wouldblock")
-        || m.contains("timed out")
-        || m.contains("timeout")
-        || m.contains("resource temporarily unavailable")
-}
-
-/// fix15-hardening (kata-containers#11649): decide what a tracked block fdset
-/// entry means at hotplug time. With no live QEMU block node and no live qdev
-/// carrying the name, the entry is stale bookkeeping left by a
-/// WouldBlock-interrupted cleanup and must be reclaimed, not rejected. A live
-/// node or device is a genuine duplicate.
-fn fdset_entry_is_stale(node_live: bool, device_live: bool) -> bool {
-    !(node_live || device_live)
-}
-
-#[cfg(test)]
-mod tests_fix15 {
-    use super::{qmp_err_is_duplicate, qmp_err_is_timeout};
-
-    #[test]
-    fn duplicate_matches_qemu_qapi() {
-        assert!(qmp_err_is_duplicate(
-            r#"Qapi(Error { class: GenericError, desc: "Duplicate nodes with node-name='drive-5'", id: None })"#
-        ));
-        assert!(qmp_err_is_duplicate(
-            r#"Qapi(Error { class: GenericError, desc: "Node drive-5 is in use", id: None })"#
-        ));
-        assert!(!qmp_err_is_duplicate("blockdev-add backend other"));
-    }
-
-    #[test]
-    fn timeout_matches_so_rcvtimeo_wouldblock() {
-        assert!(qmp_err_is_timeout(
-            r#"Io(Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" })"#
-        ));
-        assert!(!qmp_err_is_timeout("GenericError"));
-    }
-}
-
-#[cfg(test)]
-mod tests_fix15_hardening {
-    use super::fdset_entry_is_stale;
-
-    #[test]
-    fn stale_when_no_live_node_and_no_live_qdev() {
-        // The 2026-10-22 deadlock signature: entry re-queued by a WouldBlock
-        // remove_fdset_ids run, retry arrives, QEMU verified clean.
-        assert!(fdset_entry_is_stale(false, false));
-    }
-
-    #[test]
-    fn live_node_is_a_genuine_duplicate() {
-        assert!(!fdset_entry_is_stale(true, false));
-    }
-
-    #[test]
-    fn live_qdev_is_a_genuine_duplicate() {
-        assert!(!fdset_entry_is_stale(false, true));
-    }
-
-    #[test]
-    fn both_live_is_a_genuine_duplicate() {
-        assert!(!fdset_entry_is_stale(true, true));
     }
 }
