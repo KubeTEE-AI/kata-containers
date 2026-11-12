@@ -67,7 +67,7 @@ use virt_container::{
 use wasm_container::WasmContainer;
 
 use crate::{
-    shim_mgmt::server::MgmtServer,
+    shim_mgmt::server::{ensure_no_leftover_sandbox, MgmtServer},
     tracer::{KataTracer, ROOTSPAN},
 };
 
@@ -176,6 +176,10 @@ impl RuntimeHandlerManagerInner {
     ) -> Result<()> {
         init_runtime_handlers()?;
 
+        // Refuse before starting a VM: never bind over a previous shim's
+        // management socket or duplicate its sandbox.
+        ensure_no_leftover_sandbox(&self.id)?;
+
         let mut config =
             load_config(&sandbox_config.annotations, options).context("load config")?;
 
@@ -268,7 +272,7 @@ impl RuntimeHandlerManagerInner {
         )
         .context(ERR_NO_SHIM_SERVER)?;
 
-        tokio::task::spawn(Arc::new(shim_mgmt_svr).run());
+        tokio::task::spawn(shim_mgmt_svr.run());
         info!(sl!(), "shim management http server starts");
 
         Ok(())
@@ -390,6 +394,9 @@ impl RuntimeHandlerManager {
         if inner.runtime_instance.is_some() {
             return Ok(());
         }
+
+        // Before creating a network namespace that a refused start would leak.
+        ensure_no_leftover_sandbox(&inner.id)?;
 
         let mut dns: Vec<String> = vec![];
 
