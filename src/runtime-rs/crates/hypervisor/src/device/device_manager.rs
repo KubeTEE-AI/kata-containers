@@ -125,10 +125,6 @@ impl DeviceManager {
         self.devices.contains_key(device_id)
     }
 
-    pub fn has_device(&self, device_id: &str) -> bool {
-        self.devices.contains_key(device_id)
-    }
-
     pub fn get_pcie_topology(&self) -> Option<PCIeTopology> {
         self.pcie_topology.clone()
     }
