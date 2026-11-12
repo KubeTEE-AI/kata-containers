@@ -178,6 +178,9 @@ impl RuntimeHandlerManagerInner {
 
         let mut config =
             load_config(&sandbox_config.annotations, options).context("load config")?;
+        // Refuse to bind over a prior shim's management socket; leave its VM
+        // and sandbox state untouched for its owning lifecycle.
+        ensure_no_leftover_sandbox(&self.id)?;
 
         let hypervisor_name = &config.runtime.hypervisor_name;
         let hypervisor = config
