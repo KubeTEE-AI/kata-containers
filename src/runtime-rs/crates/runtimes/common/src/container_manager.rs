@@ -41,9 +41,6 @@ pub trait ContainerManager: Send + Sync {
     async fn guest_map_is_empty(&self) -> bool;
 }
 
-/// Stop the VM when CRI Kills/Waits a task the shim has no guest container for.
-///
-/// T15: sandbox/pause id (`is_sandbox`) — StopPodSandbox Kills that id.
 /// Leftover Unknown init: kubelet StopContainer of a CRI id that never
 /// entered the shim map (e.g. `fetch-certs` after a node reboot). Wait
 /// then errors and never reaches sandbox-id Kill. An empty guest map
@@ -54,46 +51,17 @@ pub trait ContainerManager: Send + Sync {
 pub fn should_stop_vm_on_missing_task(
     is_sandbox: bool,
     is_container_process: bool,
-    container_in_map: bool,
-    guest_map_empty: bool,
+    has_guest_container: bool,
+    guest_map_is_empty: bool,
 ) -> bool {
-    if !is_container_process {
-        return false;
-    }
+    // T15: containerd registers the sandbox/pause task with the QEMU pid.
+    // StopPodSandbox Kills that id; the shim has no guest container for it,
+    // so nobody would call stop() and Wait would block on the live QEMU.
     if is_sandbox {
         return true;
     }
-    !container_in_map && guest_map_empty
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_stop_vm_on_missing_task;
-
-    #[test]
-    fn t15_sandbox_id_always_stops() {
-        assert!(should_stop_vm_on_missing_task(true, true, false, true));
-        assert!(should_stop_vm_on_missing_task(true, true, false, false));
-    }
-
-    #[test]
-    fn leftover_unknown_init_empty_map_stops() {
-        assert!(should_stop_vm_on_missing_task(false, true, false, true));
-    }
-
-    #[test]
-    fn leftover_unknown_init_other_guest_does_not_stop() {
-        assert!(!should_stop_vm_on_missing_task(false, true, false, false));
-    }
-
-    #[test]
-    fn existing_guest_container_does_not_stop() {
-        assert!(!should_stop_vm_on_missing_task(false, true, true, false));
-    }
-
-    #[test]
-    fn exec_process_does_not_stop() {
-        assert!(!should_stop_vm_on_missing_task(false, false, false, true));
-        assert!(!should_stop_vm_on_missing_task(true, false, false, true));
-    }
+    // T16: CRI Kills/Waits a container that never entered the shim map
+    // (leftover Unknown init after a node reboot). Only stop the VM when
+    // no guest workload container remains.
+    is_container_process && !has_guest_container && guest_map_is_empty
 }

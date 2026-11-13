@@ -84,14 +84,6 @@ impl ResourceManager {
         inner.handle_network(network_config).await
     }
 
-    /// Tear down network endpoints / taps and clear the cached network so a
-    /// retry of `sandbox.start()` can recreate them. See kata-containers#13564
-    /// follow-up (tap0_kata TUNSETIFF EBUSY on concurrent CreateContainer).
-    pub async fn release_network(&self) -> Result<()> {
-        let mut inner = self.inner.write().await;
-        inner.release_network().await
-    }
-
     #[instrument]
     pub async fn setup_after_start_vm(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
@@ -230,6 +222,18 @@ impl ResourceManager {
     pub async fn cleanup(&self) -> Result<()> {
         let inner = self.inner.read().await;
         inner.cleanup().await
+    }
+
+    pub async fn has_passthrough_network_devices(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.has_passthrough_network_devices().await
+    }
+
+    /// Kills every process left in the sandbox cgroups and waits until
+    /// they are empty. Only for a shim that does not run in them.
+    pub async fn kill_sandbox_processes(&self, wait: std::time::Duration) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.cgroups_resource.kill_all_processes(wait).await
     }
 }
 

@@ -170,9 +170,28 @@ impl ContainerManager for VirtContainerManager {
         match process.process_type {
             ProcessType::Container => {
                 let mut containers = self.containers.write().await;
-                let c = containers
+                let mut c = containers
                     .remove(container_id)
                     .ok_or_else(|| Error::ContainerNotFound(container_id.to_string()))?;
+                // Returning an error here blocks containerd from processing the exit
+                // and reaching sandbox teardown, so report the cleanup failure and continue.
+                if let Err(e) = c.finish_cleanup().await {
+                    error!(
+                        sl!(),
+                        "failed to finish cleanup of container {}: {:?}", container_id, e
+                    );
+                }
+
+                // A task that never started has no exit-driven cleanup to release its mounts.
+                let status = c.state_process(process).await.context("state process")?;
+                if status.status == ProcessStatus::Created {
+                    if let Err(e) = c.cleanup().await {
+                        warn!(
+                            logger_with_process(process),
+                            "failed to clean up container deleted before start: {:?}", e
+                        );
+                    }
+                }
 
                 // Poststop Hooks:
                 // * should be run in runtime namespace
@@ -264,28 +283,6 @@ impl ContainerManager for VirtContainerManager {
                         "container" => container_id,
                         "signal" => req.signal
                     );
-                    // #region agent log
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let payload = serde_json::json!({
-                        "sessionId": "b73125",
-                        "hypothesisId": "T1",
-                        "location": "container_manager.rs:kill_process",
-                        "message": "termination signal ignored; container does not exist",
-                        "data": {"container_id": container_id, "signal": req.signal},
-                        "timestamp": ts,
-                    });
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/run/debug-b73125.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(f, "{}", payload);
-                    }
-                    // #endregion
                     return Ok(());
                 }
                 return Err(Error::ContainerNotFound(container_id.clone()).into());
@@ -306,7 +303,7 @@ impl ContainerManager for VirtContainerManager {
         // agent returns ProcessAlreadyTerminated error.
         // For SIGKILL/SIGTERM, we should treat these as success since the
         // container is effectively terminated.
-        c.kill_process(&req.process, req.signal, req.all)
+        c.kill_process(self.containers.clone(), &req.process, req.signal, req.all)
             .await
             .or_else(|err| {
                 let is_term_signal = is_termination_signal(req.signal);

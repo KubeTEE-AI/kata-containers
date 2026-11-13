@@ -11,30 +11,27 @@ mod qmp;
 use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::hypervisor_persist::HypervisorState;
-use crate::{Hypervisor, MemoryConfig};
+use crate::utils::SocketAddress;
+use crate::{Hypervisor, MemoryConfig, TdxConfig};
 use crate::{HypervisorConfig, VcpuThreadIds};
 use inner::QemuInner;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
+use kata_types::config::hypervisor::RootlessUser;
 use persist::sandbox_persist::Persist;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-use tokio::process::Child;
 use tokio::sync::RwLock;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug)]
 pub struct Qemu {
     inner: Arc<RwLock<QemuInner>>,
     exit_waiter: Mutex<(mpsc::Receiver<()>, i32)>,
-    /// Exit code published by the sole OS-thread reaper (fix10).
-    /// `None` until QEMU has been reaped.
-    reaped_exit: watch::Sender<Option<i32>>,
 }
 
 impl Default for Qemu {
@@ -46,12 +43,10 @@ impl Default for Qemu {
 impl Qemu {
     pub fn new() -> Self {
         let (exit_notify, exit_waiter) = mpsc::channel(1);
-        let (reaped_exit, _) = watch::channel(None);
 
         Self {
             inner: Arc::new(RwLock::new(QemuInner::new(exit_notify))),
             exit_waiter: Mutex::new((exit_waiter, 0)),
-            reaped_exit,
         }
     }
 
@@ -59,124 +54,6 @@ impl Qemu {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
-
-    async fn wait_for_reaped_exit(&self) -> i32 {
-        let mut rx = self.reaped_exit.subscribe();
-        loop {
-            if let Some(code) = *rx.borrow_and_update() {
-                return code;
-            }
-            if rx.changed().await.is_err() {
-                return 0;
-            }
-        }
-    }
-
-    /// Signal QEMU and spawn the OS reaper. When `wait` is true, join the
-    /// reaper for up to `timeout` (fix12 start-fail path).
-    async fn stop_vm_signal_and_reap(&self, wait: bool, timeout: Duration) -> Result<()> {
-        let (kill_result, child) = {
-            let mut inner = self.inner.write().await;
-            let kill_result = inner.stop_vm().await;
-            let child = if kill_result.is_ok() {
-                inner.take_qemu_child().await
-            } else {
-                None
-            };
-            (kill_result, child)
-        };
-        if let Some(child) = child {
-            info!(
-                sl!(),
-                "fix10: stop_vm took qemu Child pid={:?}; spawning OS reaper",
-                child.id()
-            );
-            spawn_os_reaper(child, Some(self.reaped_exit.clone()));
-        } else if kill_result.is_ok() {
-            info!(
-                sl!(),
-                "fix10: stop_vm Child already taken; start_vm waiter / prior reaper owns wait"
-            );
-        }
-
-        if wait && kill_result.is_ok() {
-            // Already reaped?
-            if self.reaped_exit.borrow().is_some() {
-                return kill_result;
-            }
-            let mut rx = self.reaped_exit.subscribe();
-            match tokio::time::timeout(timeout, async {
-                loop {
-                    if rx.borrow_and_update().is_some() {
-                        return;
-                    }
-                    if rx.changed().await.is_err() {
-                        return;
-                    }
-                }
-            })
-            .await
-            {
-                Ok(()) => {
-                    info!(sl!(), "fix12: QEMU reaped within start-fail timeout");
-                }
-                Err(_) => {
-                    warn!(
-                        sl!(),
-                        "fix12: QEMU still alive after {:?}; proceeding to release_network \
-                         (tap may still be busy if FDs held)",
-                        timeout
-                    );
-                }
-            }
-        }
-        kill_result
-    }
-}
-
-/// Reap QEMU on a dedicated OS thread using sync `try_wait()`.
-///
-/// fix10 (kata-containers#13564): a tokio task awaiting `Child::wait()` can
-/// be cancelled when containerd SIGKILLs / abandons the shim after a
-/// non-blocking Shutdown — Dropping the Child without a successful wait
-/// leaves QEMU as a zombie under the (still-alive) orphaned shim. An OS
-/// thread is not cancelled with the tokio task; `try_wait` reaps on Unix.
-///
-/// fix11: also used on start_vm failure paths (`reaped_exit = None`).
-pub(crate) fn spawn_os_reaper(child: Child, reaped_exit: Option<watch::Sender<Option<i32>>>) {
-    let pid = child.id();
-    let _ = thread::Builder::new()
-        .name("qemu-reap".into())
-        .spawn(move || {
-            let mut child = child;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let code = status.code().unwrap_or(0);
-                        info!(
-                            sl!(),
-                            "fix10 OS reaper: qemu pid={:?} exited code={}", pid, code
-                        );
-                        if let Some(tx) = reaped_exit {
-                            let _ = tx.send(Some(code));
-                        }
-                        return;
-                    }
-                    Ok(None) => thread::sleep(Duration::from_millis(200)),
-                    Err(e) => {
-                        // ECHILD if a racing reaper already collected the status.
-                        warn!(
-                            sl!(),
-                            "fix10 OS reaper: try_wait pid={:?} err={:?}", pid, e
-                        );
-                        if let Some(tx) = reaped_exit {
-                            let _ = tx.send(Some(0));
-                        }
-                        return;
-                    }
-                }
-            }
-        });
 }
 
 #[async_trait]
@@ -193,41 +70,13 @@ impl Hypervisor for Qemu {
     }
 
     async fn start_vm(&self, timeout: i32) -> Result<()> {
-        // Reset prior exit code so fix12 start-fail wait does not observe a
-        // stale reaped_exit from an earlier attempt in this shim process.
-        let _ = self.reaped_exit.send(None);
         let mut inner = self.inner.write().await;
         inner.start_vm(timeout).await
     }
 
     async fn stop_vm(&self) -> Result<()> {
-        // fix8: signal under write lock only (start_kill), never hold locks
-        // across the multi-minute TDX reclaim wait.
-        // fix9: do NOT await wait_vm() here either — that still blocked the
-        // Shutdown RPC long enough for containerd to SIGKILL the shim, leaving
-        // a live orphan QEMU under init (production B200+TDX, ~1.2 TiB guest).
-        // PR_SET_PDEATHSIG kills QEMU if the shim process exits/dies first.
-        //
-        // fix10: take the Child here and reap on an OS thread (try_wait loop).
-        // The old tokio::spawn(inner.wait_vm()) raced the start_vm waiter for
-        // Child ownership; the loser logged "the process has been reaped" and
-        // the winner's Child::wait() was abandoned when the shim task was
-        // cancelled → zombie QEMU under an orphaned live shim (glm B200).
-        self.stop_vm_signal_and_reap(/* wait */ false, Duration::from_secs(0))
-            .await
-    }
-
-    async fn stop_vm_for_start_fail(&self, timeout: Duration) -> Result<()> {
-        // fix12: on sandbox.start() failure, CreateContainer retries immediately.
-        // Non-blocking stop leaves QEMU holding tap FDs → TUNSETIFF EBUSY.
-        // Bound the wait so we release taps before release_network(); do not
-        // use this for Shutdown (1.2 TiB TDX reclaim).
-        info!(
-            sl!(),
-            "fix12: stop_vm_for_start_fail waiting up to {:?} for QEMU reap",
-            timeout
-        );
-        self.stop_vm_signal_and_reap(/* wait */ true, timeout).await
+        let mut inner = self.inner.write().await;
+        inner.stop_vm().await
     }
 
     async fn wait_vm(&self) -> Result<i32> {
@@ -235,33 +84,22 @@ impl Hypervisor for Qemu {
 
         let mut waiter = self.exit_waiter.lock().await;
 
-        // Wait until qemu stderr EOF (process exited / closed stderr).
+        //wait until the qemu process exited.
         waiter.0.recv().await;
 
-        // Already reaped by stop_vm's OS thread?
-        if let Some(code) = *self.reaped_exit.borrow() {
-            waiter.1 = code;
-            return Ok(code);
-        }
-
-        // Take Child for OS-thread reaping (same fix10 path as stop_vm).
-        // Do NOT Child::wait().await on this cancellable task.
-        let child = {
+        // Take ownership while holding the lock, then release it before
+        // waiting. stop_vm() must remain able to signal a slow-exiting QEMU.
+        let process = {
             let inner = self.inner.read().await;
-            inner.take_qemu_child().await
+            inner.take_qemu_process().await
         };
-        if let Some(child) = child {
-            info!(
-                sl!(),
-                "fix10: wait_vm took qemu Child pid={:?}; spawning OS reaper",
-                child.id()
-            );
-            spawn_os_reaper(child, Some(self.reaped_exit.clone()));
+        if let Ok(mut process) = process {
+            let status = process.wait().await?;
+            waiter.1 = status.code().unwrap_or(0);
+            self.inner.read().await.mark_exited();
         }
 
-        let code = self.wait_for_reaped_exit().await;
-        waiter.1 = code;
-        Ok(code)
+        Ok(waiter.1)
     }
 
     async fn pause_vm(&self) -> Result<()> {
@@ -292,6 +130,23 @@ impl Hypervisor for Qemu {
     async fn update_device(&self, device: DeviceType) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.update_device(device).await
+    }
+
+    async fn set_rootless_user(&self, user: RootlessUser) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        let mut config = inner.hypervisor_config();
+        config.security_info.rootless_user = Some(user);
+        inner.set_hypervisor_config(config);
+        Ok(())
+    }
+
+    async fn tdx_quote_socket_path(&self, config: &TdxConfig) -> Result<Option<PathBuf>> {
+        // QEMU's TDX guest object consumes TdxConfig::qgs_port through its
+        // `quote-generation-socket` property. Other hypervisor backends do not
+        // currently consume qgs_port when adding a TDX protection device, so
+        // for the time being endpoint selection remains VMM-specific.
+        let socket = SocketAddress::new(config.qgs_port);
+        Ok((socket.typ == "unix").then(|| PathBuf::from(socket.path)))
     }
 
     async fn get_agent_socket(&self) -> Result<String> {
@@ -412,13 +267,11 @@ impl Persist for Qemu {
         hypervisor_state: Self::State,
     ) -> Result<Self> {
         let (exit_notify, exit_waiter) = mpsc::channel(1);
-        let (reaped_exit, _) = watch::channel(None);
 
         let inner = QemuInner::restore(exit_notify, hypervisor_state).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
             exit_waiter: Mutex::new((exit_waiter, 0)),
-            reaped_exit,
         })
     }
 }

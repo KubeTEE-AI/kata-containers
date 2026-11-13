@@ -1,111 +1,123 @@
-name: Build and Publish Kata Shim Overlay NVSwitch
+# KubeTEE runtime-rs shim overlay image (4.3.1) — build + publish.
+#
+# The overlay scheme: upstream's official kata-deploy image is consumed
+# BYTE-PRISTINE (never rebuilt or repacked); a tiny sidecar DaemonSet copies
+# our patched containerd-shim-kata-v2 over the stock binary after kata-deploy
+# extracts it (tools/kubetee-shim-overlay/overlay.sh — cmp-based idempotent
+# copy + 60s watch loop).
+#
+# The ONLY build artifact is the shim binary via upstream's shim-v2 recipe
+# (tools/packaging/static-build/shim-v2/Dockerfile dep list).
+#
+# Patch scope on branch kubetee-fix11649-t15t16 (evidence-based per the
+# Phase 0.5b/0.5c battery on 4.3.1, 2026-10-22/23):
+#  - fix15 / kata-containers#11649: idempotent block hotplug +
+#    hotplug-sized QMP read timeout (qmp.rs) — REPRODUCED on stock 4.3.1
+#    (duplicate QEMU block device ID drive-5 after fetch-certs init unplug).
+#  - fix15-hardening: reclaim stale fdsets at hotplug (fdset_entry_is_stale
+#    classifier) — closes the remove_fd WouldBlock re-queue dead-end.
+#  - T15/T16 / #13665+#13746: stop_vm on missing-task Kill/Wait
+#    (should_stop_vm_on_missing_task + guest_map_is_empty) — REPRODUCED
+#    2026-10-23 (tq8bb: graceful delete wedged 105 min on fix11649; healthy
+#    shim, QEMU never signaled; unblocked only by kill -TERM <qemu>).
+#  - fix16 / #13641: CONSCIOUSLY DROPPED — not reproduced on 4.3.1 + kernel
+#    7.0.0-39 (the host-fsnotify confounder is fixed in 7.0.0-39). Re-add
+#    only on new evidence.
+#
+# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.3.1-fix11649-t15t16 (NEW tag)
+
+name: build-shim-overlay
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - kubetee-staging
+      - kubetee-fix11649-t15t16
     paths:
-      - 'src/runtime-rs/crates/hypervisor/src/device/driver/vfio_device/core.rs'
-      - 'src/runtime-rs/crates/hypervisor/src/qemu/inner.rs'
-      - 'src/runtime-rs/crates/hypervisor/src/qemu/mod.rs'
-      - 'src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs'
-      - 'src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs'
-      - 'src/runtime-rs/crates/runtimes/src/manager.rs'
-      - 'src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs'
-      - 'src/runtime-rs/crates/resource/src/network/**'
-      - 'src/runtime-rs/crates/resource/src/manager.rs'
-      - 'src/runtime-rs/crates/resource/src/manager_inner.rs'
-      - 'src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs'
-      - 'src/runtime-rs/crates/hypervisor/src/lib.rs'
+      - 'src/runtime-rs/**'
+      - 'Cargo.lock'
       - 'tools/kubetee-shim-overlay/**'
       - '.github/workflows/build-shim-overlay.yaml'
+
+concurrency:
+  group: shim-overlay-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  # fix1 (4.2.0 rebase): the full KubeTEE stack (QEMU start/stop serialization,
-  # tap EBUSY reclaim, PDEATHSIG, OS-thread reap, timed QMP connect,
-  # stop_vm_for_start_fail, try_lock stop, qemu_died fail-fast, fix15
-  # idempotent blockdev-add, fix16 inotify close-off-runtime, T15 sandbox-id
-  # Kill/Wait, T16 guest_map_is_empty ignoring the pause entry, fix22 no
-  # nvidia.com/nic CDI mapping) rebased onto kata 4.2.0 (c7351e797), keeping
-  # 4.2.0's fd-passing (#13546/#13548), console-watcher-before-start (#13437),
-  # and RLIMIT_MEMLOCK raise. All nine upstream PRs closed unmerged 2026-09-13
-  # — this stack is ours alone again.
-  SHIM_TAG: v4.2.0-nvswitch-fix1
+  SHIM_TAG: v4.3.1-fix11649-t15t16
+  # Pin ONE exact toolchain for every step. rust-toolchain.toml only pins
+  # `channel = "1.97"` (no patch), so `rustup target add` and `cargo build` can
+  # resolve DIFFERENT 1.97.x toolchains — musl rust-std lands in one while the
+  # build uses the other -> E0463: can't find crate for `core`. RUSTUP_TOOLCHAIN
+  # (highest precedence) forces one toolchain everywhere.
+  RUSTUP_TOOLCHAIN: 1.97.0
 
 jobs:
   build-and-push:
     runs-on: [self-hosted, Linux, X64]
-    permissions:
-      contents: read
-      packages: write
     steps:
       - name: Checkout kata-containers fork
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install Rust toolchain
+      - name: Patch marker gate (classes carried vs consciously dropped)
         run: |
-          rustup toolchain install 1.96.0 || true
-          rustup default 1.96.0
-          rustup target add x86_64-unknown-linux-musl
+          set -eux
+          echo "== fix15 / kata-containers#11649 idempotent block hotplug (REQUIRED) =="
+          grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          grep -n 'existing_block_hotplug' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          grep -n 'remove_fdset_ids' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "== fix15-hardening fdset reclaim (REQUIRED) =="
+          grep -n 'fdset_entry_is_stale' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "== classifier unit tests (REQUIRED) =="
+          grep -n 'mod tests_fix15' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -5
+          echo "== fix16 / kata-containers#13641 inotify (CONSCIOUSLY DROPPED — must be absent) =="
+          if grep -nE 'InotifyCloseOnThread|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs; then
+            echo "UNEXPECTED fix16 marker present"; exit 1
+          fi
+          echo "== T15/T16 / kata-containers#13665+#13746 stop_vm (REQUIRED) =="
+          grep -n 'should_stop_vm_on_missing_task' \
+            src/runtime-rs/crates/runtimes/common/src/container_manager.rs \
+            src/runtime-rs/crates/runtimes/src/manager.rs | head -5
+          grep -n 'guest_map_is_empty' \
+            src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs | head -5
+          git log --oneline -3
 
-      - name: Install build dependencies
+      - name: Install build dependencies (upstream shim-v2 recipe + our extras)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools clang llvm protobuf-compiler libseccomp-dev
+          sudo apt-get install -y -qq build-essential ca-certificates curl gcc git make cmake \
+            musl-tools protobuf-compiler clang llvm libseccomp-dev pkg-config
+          # musl-tools ships x86_64-linux-musl-gcc but NOT -g++; zlib-ng's cmake
+          # config (libz-sys, new in the 4.3.1 tree) references it — C-only lib.
+          sudo ln -sf /usr/bin/x86_64-linux-musl-gcc /usr/local/bin/x86_64-linux-musl-g++
 
-      - name: Verify patches are present
+      - name: Install Rust toolchain (pinned 1.97 = rust-toolchain.toml at 4.3.1)
         run: |
-          echo "Checking for exact PCI class ignore list (NVSwitch 0x0680 kept; no 0x0600 bitmask)"
-          grep -n 'IOMMU_IGNORE_CLASSES: &\[u16\] = &\[0x0600, 0x0604, 0x0403\]' src/runtime-rs/crates/hypervisor/src/device/driver/vfio_device/core.rs
-          echo "Checking for zombie QEMU fix in inner.rs"
-          grep -n "stop_vm" src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
-          echo "Checking for fix7 start_mutex / Starting state"
-          grep -n 'start_mutex' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
-          grep -n 'SandboxState::Starting' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
-          grep -n 'is_busy_or_exist' src/runtime-rs/crates/resource/src/network/utils/link/create.rs | head -3
-          grep -n 'release_network' src/runtime-rs/crates/resource/src/manager.rs | head -3
-          echo "Checking for fix8 start_kill / wait outside lock"
-          grep -n 'start_kill' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
-          grep -n 'qemu_pid' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -5
-          echo "Checking for fix9 PDEATHSIG + non-blocking stop"
-          grep -n 'set_pdeathsig' src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -3
-          grep -n 'not waiting for qemu exit' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
-          echo "Checking for fix10 OS-thread reaper"
-          grep -n 'spawn_os_reaper\|fix10 OS reaper\|take_qemu_child' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/qemu/inner.rs | head -10
-          echo "Checking for fix11 timed QMP connect / drop listen FD"
-          grep -n 'connect_unix_timeout\|drop_qmp_listen_fd\|kill_and_os_reap_qemu\|Qmp::connect'             src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs             src/runtime-rs/crates/hypervisor/src/qemu/inner.rs             src/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs | head -15
-          echo "Checking for fix12 start-fail bounded reap + tap held messaging"
-          grep -n 'stop_vm_for_start_fail\|fix12' src/runtime-rs/crates/hypervisor/src/qemu/mod.rs src/runtime-rs/crates/hypervisor/src/lib.rs | head -10
-          grep -n 'stop_vm_for_start_fail\|START_FAIL_REAP' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
-          grep -n 'held by live process\|nix::errno::Errno' src/runtime-rs/crates/resource/src/network/network_pair.rs src/runtime-rs/crates/resource/src/network/utils/link/create.rs | head -10
-          grep -n 'orphan-reaper\|ORPHAN_GRACE' tools/kubetee-shim-overlay/overlay.sh | head -5
-          echo "Checking for fix13 start_mutex try_lock / QEMU-death fail-fast"
-          grep -n 'try_lock' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -5
-          grep -n 'failing fast (fix13' src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs | head -3
-          echo "Checking for fix15 idempotent blockdev-add / hotplug timeout"
-          grep -n 'DEFAULT_QMP_HOTPLUG_READ_TIMEOUT\|existing_block_hotplug\|qmp_err_is_duplicate' src/runtime-rs/crates/hypervisor/src/qemu/qmp.rs | head -10
-          echo "Checking for fix16 inotify close off tokio"
-          grep -n 'InotifyCloseOnThread\|kata-inotify-close' src/runtime-rs/crates/resource/src/volume/share_fs_volume.rs | head -10
-          echo "Checking for fix18/T16 missing-task Kill/Wait → stop_vm"
-          grep -n 'should_stop_vm_on_missing_task' src/runtime-rs/crates/runtimes/src/manager.rs src/runtime-rs/crates/runtimes/common/src/container_manager.rs
-          grep -n 'stop sandbox on missing-task kill' src/runtime-rs/crates/runtimes/src/manager.rs
-          grep -n 'missing-task Wait' src/runtime-rs/crates/runtimes/src/manager.rs
-          git log --oneline -1
+          rustup toolchain install 1.97.0 || true
+          rustup default 1.97.0
+          rustup target add x86_64-unknown-linux-musl
 
-      - name: Generate config.rs
+      - name: Classifier unit tests (qmp.rs tests_fix15*)
+        run: |
+          set -eux
+          cargo test -p hypervisor tests_fix15 -- --nocapture
+
+      - name: Generate config.rs (gitignored build-generated; stamp 4.3.1 + commit)
         working-directory: src/runtime-rs
         run: |
-          COMMIT=$(git rev-parse --short HEAD)
+          set -eux
+          COMMIT=$(git rev-parse HEAD)
           mkdir -p crates/shim/src
-          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.2.0";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
+          printf '// SPDX-License-Identifier: Apache-2.0\n// WARNING: auto-generated\n\npub const PROJECT_NAME: &str = "Kata Containers";\npub const RUNTIME_VERSION: &str = "4.3.1";\npub const RUNTIME_GIT_COMMIT: &str = "%s";\npub const RUNTIME_NAME: &str = "containerd-shim-kata-v2";\npub const CONTAINERD_RUNTIME_NAME: &str = "io.containerd.kata.v2";\npub const RUNTIME_DIR: &str = "/usr/local/bin";\npub const RUNTIME_PATH: &str = "/usr/local/bin/containerd-shim-kata-v2";\n' "$COMMIT" > crates/shim/src/config.rs
           cat crates/shim/src/config.rs
 
-      - name: Build containerd-shim-kata-v2
+      - name: Build containerd-shim-kata-v2 (static musl)
         working-directory: src/runtime-rs
         run: |
           set -eux
@@ -117,14 +129,13 @@ jobs:
             find ../.. -name 'containerd-shim-kata-v2' -type f 2>/dev/null | head -10 || true
             exit 1
           fi
-          echo "Binary found at: $BIN"
           cp "$BIN" ./containerd-shim-kata-v2
-          ls -la ./containerd-shim-kata-v2
           sha256sum ./containerd-shim-kata-v2
           file ./containerd-shim-kata-v2
 
       - name: Stage binary and create overlay image
         run: |
+          set -eux
           mkdir -p overlay-image
           cp src/runtime-rs/containerd-shim-kata-v2 overlay-image/
           cp tools/kubetee-shim-overlay/overlay.sh overlay-image/overlay.sh
@@ -138,14 +149,31 @@ jobs:
 
       - name: Build and push overlay image
         run: |
+          set -eux
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG}"
           docker buildx build --platform linux/amd64 \
             -f overlay-image/Dockerfile \
-            -t ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} \
+            --provenance false --sbom false \
+            -t "${IMAGE_REF}" \
             --push \
             overlay-image/
-          echo "Pushed ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG}"
+          echo "Pushed ${IMAGE_REF}"
 
-      - name: Verify image
+      - name: Verify image (shim sha + overlay marker)
+        env:
+          IMAGE_REF: ghcr.io/kubetee-ai/kata-deploy-shim-overlay
         run: |
-          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} sha256sum /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 || true
-          docker run --rm ${REGISTRY}/${IMAGE_NAME}:${SHIM_TAG} grep -n orphan-reaper /overlay.sh | head -5
+          set -eux
+          IMG="${IMAGE_REF}:${SHIM_TAG}"
+          docker pull -q "${IMG}"
+          docker run --rm "${IMG}" sha256sum /opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+          docker run --rm "${IMG}" grep -n fix11649 /overlay.sh | head -5
+          echo "== image manifest digest (digest-pin this in the Fleet daemonset) =="
+          docker buildx imagetools inspect "${IMG}" | head -4
+          {
+            echo "## shim overlay ${SHIM_TAG}"
+            echo '- shim sha256: see `sha256sum` line above (pin in the CC post-reboot checklist)'
+            echo '```'
+            docker buildx imagetools inspect "${IMG}" | head -4
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

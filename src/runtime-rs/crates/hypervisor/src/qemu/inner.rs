@@ -4,8 +4,7 @@
 //
 
 use super::cmdline_generator::{get_network_device, QemuCmdLine};
-use super::qmp::{Qmp, DEFAULT_QMP_CONNECT_DEADLINE_MS};
-use super::spawn_os_reaper;
+use super::qmp::Qmp;
 use crate::device::pci_path::PciPath;
 use crate::device::topology::PCIePort;
 use crate::qemu::cmdline_generator::VfioDeviceConfig;
@@ -17,8 +16,9 @@ use crate::{
 };
 
 use crate::utils::{
-    bytes_to_megs, create_dir_all_with_inherit_owner, enter_netns, get_jailer_root, megs_to_bytes,
-    set_process_credentials, uses_native_ccw_bus, vm_cleanup,
+    bytes_to_megs, check_unix_socket_path_len, create_dir_all_with_inherit_owner, enter_netns,
+    get_jailer_root, link_rootless_vmm_socket, megs_to_bytes, set_process_credentials,
+    uses_native_ccw_bus, vm_cleanup,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -31,17 +31,16 @@ use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
     config::KATA_PATH,
 };
-use nix::sys::signal::Signal;
-use nix::sys::prctl::set_pdeathsig;
-use nix::unistd::{setgid, setuid, Gid, Uid};
 use persist::sandbox_persist::Persist;
 use qapi_qmp::MigrationStatus;
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::sleep;
@@ -58,15 +57,38 @@ use tokio::{
 const VSOCK_SCHEME: &str = "vsock";
 const MEMLOCK_HEADROOM_DIVISOR: u64 = 10;
 
+fn open_qemu_pidfd(pid: u32) -> Result<Arc<OwnedFd>> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("open QEMU pidfd");
+    }
+    Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as i32) }))
+}
+
+fn qemu_is_gone(exit_reaped: bool, qmp_connected: bool, pidfd: Option<&OwnedFd>) -> bool {
+    if exit_reaped || !qmp_connected {
+        return true;
+    }
+    let Some(pidfd) = pidfd else {
+        return false;
+    };
+    let mut pollfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    rc > 0 && pollfd.revents & libc::POLLIN != 0
+}
+
 #[derive(Debug)]
 pub struct QemuInner {
     /// sandbox id
     id: String,
 
     qemu_process: Mutex<Option<Child>>,
-    /// Cached QEMU pid so stop_vm can signal even after wait_vm() has taken
-    /// the Child out of `qemu_process` (kata-containers#13564 fix8).
-    qemu_pid: Option<u32>,
+    qemu_pidfd: Option<Arc<OwnedFd>>,
+    vm_exited: std::sync::atomic::AtomicBool,
     qmp: Option<Qmp>,
 
     config: HypervisorConfig,
@@ -81,7 +103,8 @@ impl QemuInner {
         QemuInner {
             id: "".to_string(),
             qemu_process: Mutex::new(None),
-            qemu_pid: None,
+            qemu_pidfd: None,
+            vm_exited: std::sync::atomic::AtomicBool::new(false),
             qmp: None,
             config: Default::default(),
             devices: Vec::new(),
@@ -101,12 +124,7 @@ impl QemuInner {
         self.id = id.to_string();
         self.netns = netns;
 
-        if !self.hypervisor_config().disable_selinux {
-            if let Some(label) = selinux_label.as_ref() {
-                self.config.security_info.selinux_label = Some(label.to_string());
-                selinux::set_exec_label(label).context("failed to set SELinux process label")?;
-            }
-        }
+        self.config.set_selinux_label(selinux_label);
 
         let vm_path =
             Path::new(prefix_with_rootless_dir(KATA_PATH).as_str()).join(self.id.as_str());
@@ -115,7 +133,7 @@ impl QemuInner {
         Ok(())
     }
 
-    pub(crate) async fn start_vm(&mut self, timeout: i32) -> Result<()> {
+    pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         info!(sl!(), "Starting QEMU VM");
         let netns = self.netns.clone().unwrap_or_default();
 
@@ -136,8 +154,14 @@ impl QemuInner {
             match device {
                 DeviceType::ShareFs(share_fs_dev) => {
                     if share_fs_dev.config.fs_type == "virtio-fs" {
+                        let mut sock_path = PathBuf::from(&share_fs_dev.config.sock_path);
+                        if is_rootless() {
+                            sock_path = link_rootless_vmm_socket(&self.id, &sock_path)
+                                .context("link rootless virtiofsd socket")?;
+                        }
+                        check_unix_socket_path_len(&sock_path)?;
                         cmdline.add_virtiofs_share(
-                            &share_fs_dev.config.sock_path,
+                            &sock_path.to_string_lossy(),
                             &share_fs_dev.config.mount_tag,
                             share_fs_dev.config.queue_size,
                         );
@@ -168,7 +192,7 @@ impl QemuInner {
                         (
                             device_id,
                             cfg.path_on_host.clone(),
-                            cfg.vmdk.clone(),
+                            cfg.source.clone(),
                             cfg.is_direct
                                 .unwrap_or(self.config.blockdev_info.block_device_cache_direct),
                             cfg.is_readonly,
@@ -194,7 +218,7 @@ impl QemuInner {
                             cmdline.add_block_device(
                                 device_id.as_str(),
                                 &path_on_host,
-                                vmdk.as_ref(),
+                                &vmdk,
                                 is_direct,
                                 is_readonly,
                                 driver_option.as_str() == KATA_SCSI_DEV_TYPE,
@@ -423,34 +447,12 @@ impl QemuInner {
             None
         };
 
-        // we need move the qemu process into Network Namespace and set SELinux label.
-        unsafe {
-            let selinux_label = self.config.security_info.selinux_label.clone();
-            let _pre_exec = command.pre_exec(move || {
-                // fix9 (kata-containers#13564): if the shim is SIGKILLed mid-
-                // teardown (or exits after Shutdown before QEMU finishes
-                // reclaiming a large TDX guest), the kernel must kill QEMU.
-                // Without this, QEMU is reparented to init as a live orphan and
-                // the Kubernetes pod stays Terminating. Set before exec; check
-                // getppid for the classic fork/PDEATHSIG race.
-                set_pdeathsig(Signal::SIGKILL).map_err(std::io::Error::from)?;
-                if nix::unistd::getppid().as_raw() == 1 {
-                    let _ = nix::sys::signal::raise(Signal::SIGKILL);
-                }
+        selinux::apply_exec_label(&mut command, self.config.effective_selinux_label(), "QEMU")?;
 
+        // Move the QEMU child into its network namespace and set credentials.
+        unsafe {
+            let _pre_exec = command.pre_exec(move || {
                 let _ = enter_netns(&netns);
-                if let Some(label) = selinux_label.as_ref() {
-                    if let Err(e) = selinux::set_exec_label(label) {
-                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
-                        // Don't return error here to avoid breaking the process startup
-                        // Log the error and continue
-                    } else {
-                        info!(
-                            sl!(),
-                            "Successfully set SELinux label in child process: {}", &label
-                        );
-                    }
-                }
                 if let Some(user) = &user {
                     if let Some(limit) = memlock_limit {
                         set_memlock_rlimit(limit)
@@ -464,19 +466,26 @@ impl QemuInner {
             });
         }
 
-        let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
+        let mut qemu_process = command
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn QEMU")?;
+        self.qemu_pidfd = qemu_process
+            .id()
+            .and_then(|pid| match open_qemu_pidfd(pid) {
+                Ok(pidfd) => Some(pidfd),
+                Err(err) => {
+                    warn!(sl!(), "could not open QEMU pidfd: {err:#}");
+                    None
+                }
+            });
         // QEMU inherited its startup descriptors during spawn. Drop the
         // privileged shim's copies immediately; QEMU owns the fdsets from here.
         drop(cmdline);
         let stderr = qemu_process.stderr.take().unwrap();
-        self.qemu_pid = qemu_process.id();
         self.qemu_process = Mutex::new(Some(qemu_process));
 
-        info!(
-            sl!(),
-            "qemu process started (pid={:?})",
-            self.qemu_pid
-        );
+        info!(sl!(), "qemu process started");
 
         let exit_notify: mpsc::Sender<()> = self
             .exit_notify
@@ -486,9 +495,6 @@ impl QemuInner {
         tokio::spawn(log_qemu_stderr(stderr, exit_notify));
 
         // When hypervisor debug is enabled, output the kernel boot messages for debugging.
-        // (4.2.0: console watcher starts BEFORE QMP connect so early-boot output
-        // is not lost — kata #13437. It retries via try_open_qemu_console and
-        // never fails start_vm on its own.)
         if self.config.debug_info.enable_debug {
             tokio::spawn(async move {
                 let stream_result = try_open_qemu_console(&console_socket_path).await;
@@ -500,28 +506,9 @@ impl QemuInner {
             });
         }
 
-        // Any failure AFTER spawn must kill+reap the Child. The sandbox only
-        // starts its background wait_vm() waiter once start_vm() returns Ok, so
-        // an Err return without cleanup leaks QEMU as a zombie and wedges the
-        // shim in a Task/State timeout loop (kata-containers#13564). The Go
-        // runtime reaps unconditionally via LogAndWait; runtime-rs historically
-        // only cleaned up on the QMP-init / boot_from_template paths (fix4),
-        // missing virtio-mem setup, resume_vm, console connect, and any future
-        // `?` after spawn. fix5: cleanup on every failure path below.
-        // fix11 (subsumed by 4.2.0): dropping the whole QemuCmdLine right after
-        // spawn (see `drop(cmdline)` above, from #13546/#13548) already closes
-        // the parent's QMP listen FD (QmpSockType::Fd holds the File). No
-        // separate drop_qmp_listen_fd() call is needed anymore.
-
         let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
-        // sandbox passes 10_000 (ms). Keep at least the historical 50s QMP
-        // ceiling so slow CC bring-up is not regressed; each connect attempt
-        // is separately bounded (see Qmp::connect).
-        let qmp_timeout = Duration::from_millis(
-            DEFAULT_QMP_CONNECT_DEADLINE_MS.max(timeout.max(0) as u64),
-        );
 
-        match Qmp::connect(&qmp_socket_path, &self.qemu_process, qmp_timeout).await {
+        match Qmp::new(&qmp_socket_path) {
             Ok(mut qmp) => {
                 if let Some(subchannel) = ccw_subchannel {
                     qmp.set_ccw_subchannel(subchannel);
@@ -538,23 +525,13 @@ impl QemuInner {
                 // "the configuration is not prepared for memory devices".
                 if self.config.memory_info.enable_virtio_mem {
                     if has_memory_hotplug_region {
-                        if let Err(e) = qmp
-                            .setup_virtio_mem(
-                                self.config.memory_info.default_memory,
-                                self.config.memory_info.default_maxmemory,
-                                &self.config.machine_info.machine_type,
-                                self.config.shared_fs.shared_fs.as_deref(),
-                            )
-                            .context("Failed to setup virtio-mem during VM initialization")
-                        {
-                            error!(
-                                sl!(),
-                                "virtio-mem setup failed after QEMU spawn: {:?}; killing+reaping",
-                                e
-                            );
-                            self.kill_and_os_reap_qemu().await;
-                            return Err(e);
-                        }
+                        qmp.setup_virtio_mem(
+                            self.config.memory_info.default_memory,
+                            self.config.memory_info.default_maxmemory,
+                            &self.config.machine_info.machine_type,
+                            self.config.shared_fs.shared_fs.as_deref(),
+                        )
+                        .context("Failed to setup virtio-mem during VM initialization")?;
                     } else {
                         info!(
                             sl!(),
@@ -570,26 +547,16 @@ impl QemuInner {
             }
             Err(e) => {
                 error!(sl!(), "couldn't initialise QMP: {:?}", e);
-                self.kill_and_os_reap_qemu().await;
                 return Err(e);
             }
         }
 
         // Start the virtual machine by restoring it from a VM template if enabled.
         if self.config.vm_template.boot_from_template {
-            if let Err(e) = self.boot_from_template().await {
-                error!(sl!(), "boot from template failed: {:?}", e);
-                self.kill_and_os_reap_qemu().await;
-                return Err(e).context("boot from template");
-            }
-            if let Err(e) = self.resume_vm().context("resume vm") {
-                error!(
-                    sl!(),
-                    "resume_vm failed after QEMU spawn: {:?}; killing+reaping", e
-                );
-                self.kill_and_os_reap_qemu().await;
-                return Err(e);
-            }
+            self.boot_from_template()
+                .await
+                .context("boot from template")?;
+            self.resume_vm().context("resume vm")?;
         }
 
         Ok(())
@@ -688,92 +655,72 @@ impl QemuInner {
     pub(crate) async fn stop_vm(&mut self) -> Result<()> {
         info!(sl!(), "Stopping QEMU VM");
 
-        // CRITICAL (kata-containers#13564 fix8/fix9 / production B200+TDX):
-        // Do NOT use Child::kill().await while holding qemu_process — that
-        // waits for the process to exit under the mutex. On large confidential
-        // guests (e.g. 1.2 TiB TDX + 8×GPU) SIGKILL reclaim can take many
-        // minutes; containerd then SIGKILLs the shim mid-wait, the Child is
-        // never reaped, and QEMU becomes a zombie (or live orphan) under init
-        // — leaving the Kubernetes pod stuck Terminating.
-        //
-        // Use start_kill() (signal only). Reaping is done by Qemu::stop_vm /
-        // wait_vm via an OS-thread try_wait reaper (fix10) — never block
-        // stop_vm on exit. If the Child was already taken by a concurrent
-        // waiter, fall back to kill(2) on the cached pid. PR_SET_PDEATHSIG
-        // (fix9) covers the case where the shim dies before/during reclaim.
-        {
-            let mut qemu_process = self.qemu_process.lock().await;
-            if let Some(child) = qemu_process.as_mut() {
-                if let Some(pid) = child.id() {
-                    self.qemu_pid = Some(pid);
-                    info!(
-                        sl!(),
-                        "QemuInner::stop_vm(): start_kill() qemu pid={}", pid
-                    );
-                    // Signal only — do not await exit here (see comment above).
-                    child.start_kill().map_err(anyhow::Error::from)?;
-                    return Ok(());
+        if let Some(pidfd) = &self.qemu_pidfd {
+            let pidfd = pidfd.clone();
+            info!(sl!(), "QemuInner::stop_vm(): signalling qemu through pidfd");
+            return tokio::task::spawn_blocking(move || {
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(err).context("signal QEMU through pidfd");
+                    }
                 }
+                Ok(())
+            })
+            .await
+            .context("join QEMU signal task")?;
+        }
+
+        let mut qemu_process = self.qemu_process.lock().await;
+        if let Some(qemu_process) = qemu_process.as_mut() {
+            let is_qemu_running = qemu_process.id().is_some();
+            if is_qemu_running {
+                info!(sl!(), "QemuInner::stop_vm(): kill()'ing qemu");
+                // The exit watcher owns reaping. Waiting here holds the QEMU
+                // lock and can stall teardown when device reset delays exit.
+                qemu_process.start_kill().map_err(anyhow::Error::from)
+            } else {
                 info!(
                     sl!(),
-                    "QemuInner::stop_vm(): qemu Child present but not running \
-                     (already exited); wait_vm will reap"
+                    "QemuInner::stop_vm(): qemu process isn't running (likely stopped already)"
                 );
-                return Ok(());
+                Ok(())
             }
-        }
-
-        if let Some(pid) = self.qemu_pid {
-            info!(
-                sl!(),
-                "QemuInner::stop_vm(): Child already taken; kill(2) pid={}", pid
-            );
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            return Ok(());
-        }
-
-        Err(anyhow!("qemu process has not been started yet"))
-    }
-
-
-    /// Kill QEMU and reap via the fix10 OS-thread path (fix11).
-    /// Do not use `wait_vm()` here — that awaits Child on a cancellable tokio
-    /// task and historically left zombies when start failed mid-QMP.
-    async fn kill_and_os_reap_qemu(&mut self) {
-        let _ = self.stop_vm().await;
-        if let Some(child) = self.take_qemu_child().await {
-            info!(
-                sl!(),
-                "fix11: start-fail OS reaper for qemu pid={:?}",
-                child.id()
-            );
-            spawn_os_reaper(child, None);
-        }
-    }
-
-    /// Take ownership of the QEMU Child for reaping. Used by fix10 so stop_vm
-    /// (or wait_vm) can move the Child onto an OS thread that survives tokio
-    /// task cancellation.
-    pub(crate) async fn take_qemu_child(&self) -> Option<Child> {
-        let mut qemu_process = self.qemu_process.lock().await;
-        qemu_process.take()
-    }
-
-    pub(crate) async fn wait_vm(&self) -> Result<i32> {
-        // Take the Child under the lock, then wait OUTSIDE it so stop_vm()
-        // can always start_kill() (fix8). Holding the mutex across
-        // Child::wait() was the teardown deadlock that produced zombies.
-        let child = self.take_qemu_child().await;
-
-        if let Some(mut child) = child {
-            let status = child.wait().await?;
-            Ok(status.code().unwrap_or(0))
         } else {
-            Err(anyhow!("the process has been reaped"))
+            Err(anyhow!("qemu process has not been started yet"))
         }
+    }
+
+    pub(crate) fn mark_exited(&self) {
+        self.vm_exited
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Sandbox teardown runs only after the VMM exit is confirmed, which may
+    /// come from the exit watcher, from the pidfd, or from a restored shim
+    /// that never had a QMP connection.
+    fn is_gone(&self) -> bool {
+        qemu_is_gone(
+            self.vm_exited.load(std::sync::atomic::Ordering::Acquire),
+            self.qmp.is_some(),
+            self.qemu_pidfd.as_deref(),
+        )
+    }
+
+    pub(crate) async fn take_qemu_process(&self) -> Result<Child> {
+        let mut qemu_process = self.qemu_process.lock().await;
+        qemu_process
+            .take()
+            .ok_or_else(|| anyhow!("the process has been reaped"))
     }
 
     pub(crate) fn pause_vm(&mut self) -> Result<()> {
@@ -841,17 +788,13 @@ impl QemuInner {
                     sl!(),
                     "QemuInner::get_vmm_master_tid(): returning {}", qemu_pid
                 );
-                return Ok(qemu_pid);
+                Ok(qemu_pid)
+            } else {
+                Err(anyhow!("QemuInner::get_vmm_master_tid(): qemu process isn't running (likely stopped already)"))
             }
+        } else {
+            Err(anyhow!("qemu process not running"))
         }
-        if let Some(qemu_pid) = self.qemu_pid {
-            info!(
-                sl!(),
-                "QemuInner::get_vmm_master_tid(): returning cached {}", qemu_pid
-            );
-            return Ok(qemu_pid);
-        }
-        Err(anyhow!("qemu process not running"))
     }
 
     pub(crate) async fn get_ns_path(&self) -> Result<String> {
@@ -870,7 +813,7 @@ impl QemuInner {
             self.id.as_str(),
         ]
         .join("/");
-        vm_cleanup(&self.config, vm_path.as_str())
+        vm_cleanup(&self.config, &self.id, vm_path.as_str())
     }
 
     pub(crate) async fn resize_vcpu(
@@ -918,16 +861,12 @@ impl QemuInner {
     }
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
-        // start()/stop() debug probes call this before QEMU exists.
-        // todo!() panicked every CreateSandbox (1 Hz retry on am-b200-38).
-        match self.get_vmm_master_tid().await {
-            Ok(pid) => Ok(vec![pid]),
-            Err(_) => Ok(vec![]),
-        }
+        info!(sl!(), "QemuInner::get_pids()");
+        todo!()
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
-        Ok(())
+        todo!()
     }
 
     pub(crate) async fn get_jailer_root(&self) -> Result<String> {
@@ -969,7 +908,8 @@ impl QemuInner {
     }
 
     pub(crate) async fn get_hypervisor_metrics(&self) -> Result<String> {
-        todo!()
+        warn!(sl!(), "Get Hypervisor Metrics: Not implemented");
+        Ok(String::new())
     }
 
     pub(crate) fn set_capabilities(&mut self, flag: CapabilityBits) {
@@ -1245,14 +1185,6 @@ async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> 
         .context("next_line() failed on qemu stderr")?
     {
         info!(sl!(), "qemu stderr: {:?}", buffer);
-        // #region agent log
-        crate::qemu::qmp::debug_b73125(
-            "H12",
-            "inner.rs:log_qemu_stderr",
-            "qemu stderr",
-            serde_json::json!({"line": buffer}),
-        );
-        // #endregion
     }
 
     // Notfiy the waiter the process exit.
@@ -1282,6 +1214,14 @@ impl QemuInner {
 
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         info!(sl!(), "QemuInner::remove_device() {} ", device);
+        // Network devices cannot be hot-unplugged, but they go away with QEMU.
+        if matches!(
+            device,
+            DeviceType::Network(_) | DeviceType::VhostUserNetwork(_)
+        ) && self.is_gone()
+        {
+            return Ok(());
+        }
         self.hotunplug_device(&device).await?;
 
         self.devices.retain(|d| match (d, &device) {
@@ -1392,7 +1332,7 @@ impl QemuInner {
                     is_direct,
                     is_readonly,
                     no_drop,
-                    vmdk,
+                    source,
                     discard_unmap,
                     driver,
                     logical_sector_size,
@@ -1409,7 +1349,7 @@ impl QemuInner {
                         ),
                         cfg.is_readonly,
                         cfg.no_drop,
-                        cfg.vmdk.clone(),
+                        cfg.source.clone(),
                         cfg.discard_unmap,
                         self.config.blockdev_info.block_device_driver.clone(),
                         cfg.logical_sector_size,
@@ -1446,7 +1386,7 @@ impl QemuInner {
                         discard_unmap,
                         logical_sector_size,
                         physical_sector_size,
-                        vmdk.as_ref(),
+                        &source,
                         iothread,
                     )
                     .context("hotplug block device")?;
@@ -1602,7 +1542,8 @@ impl Persist for QemuInner {
         Ok(QemuInner {
             id: hypervisor_state.id,
             qemu_process: Mutex::new(None),
-            qemu_pid: None,
+            qemu_pidfd: None,
+            vm_exited: std::sync::atomic::AtomicBool::new(false),
             qmp: None,
             config: hypervisor_state.config,
             devices: Vec::new(),
@@ -1616,9 +1557,117 @@ impl Persist for QemuInner {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::time::Duration;
 
     use super::*;
+    use crate::qemu::Qemu;
+    use crate::Hypervisor;
     use rstest::rstest;
+
+    #[tokio::test]
+    async fn network_removal_without_qemu_does_not_hotunplug() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut qemu = QemuInner::new(exit_notify);
+
+        qemu.remove_device(DeviceType::Network(crate::NetworkDevice::default()))
+            .await
+            .unwrap();
+        qemu.remove_device(DeviceType::VhostUserNetwork(
+            crate::VhostUserNetDevice::default(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn qemu_is_gone_once_it_exits_even_without_the_watcher() {
+        assert!(!qemu_is_gone(false, true, None));
+        assert!(qemu_is_gone(true, true, None));
+        assert!(qemu_is_gone(false, false, None));
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pidfd = open_qemu_pidfd(child.id()).unwrap();
+        assert!(!qemu_is_gone(false, true, Some(&pidfd)));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(qemu_is_gone(false, true, Some(&pidfd)));
+    }
+
+    #[tokio::test]
+    async fn stop_leaves_qemu_child_for_exit_watcher_to_reap() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut qemu = QemuInner::new(exit_notify);
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        *qemu.qemu_process.lock().await = Some(child);
+
+        tokio::time::timeout(Duration::from_secs(2), qemu.stop_vm())
+            .await
+            .expect("stop must only send the signal")
+            .unwrap();
+
+        // waitid with WNOWAIT observes the zombie without reaping it. If
+        // stop_vm awaited Child::kill(), the exit watcher would lose ownership.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                assert_eq!(rc, 0, "child was reaped by stop_vm");
+                if unsafe { info.si_pid() } == pid {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not exit");
+
+        let mut child = qemu.take_qemu_process().await.unwrap();
+        assert_eq!(child.wait().await.unwrap().code().unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn watcher_wait_does_not_block_qemu_stop() {
+        let qemu = Arc::new(Qemu::new());
+        let mut inner = qemu.inner.write().await;
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        inner.qemu_pidfd = Some(open_qemu_pidfd(child.id().unwrap()).unwrap());
+        *inner.qemu_process.lock().await = Some(child);
+        let notify = inner.exit_notify.take().unwrap();
+        drop(inner);
+
+        let waiting_qemu = qemu.clone();
+        let waiter = tokio::spawn(async move { waiting_qemu.wait_vm().await });
+        notify.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let inner = qemu.inner.read().await;
+                let taken = inner.qemu_process.lock().await.is_none();
+                if taken {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exit watcher did not take the QEMU child");
+
+        tokio::time::timeout(Duration::from_secs(2), qemu.stop_vm())
+            .await
+            .expect("stop blocked behind exit watcher")
+            .unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn test_network_device_hotplug_capability() {
@@ -1636,6 +1685,16 @@ mod tests {
     fn test_memlock_limit_adds_headroom() {
         assert_eq!(memlock_limit_with_headroom(10 * 1024), 11 * 1024);
         assert_eq!(memlock_limit_with_headroom(u64::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_hypervisor_metrics_are_empty() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let qemu = QemuInner::new(exit_notify);
+
+        for _ in 0..3 {
+            assert_eq!(qemu.get_hypervisor_metrics().await.unwrap(), "");
+        }
     }
 
     #[rstest]

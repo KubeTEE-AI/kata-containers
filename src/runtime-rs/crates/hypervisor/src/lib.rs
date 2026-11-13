@@ -36,7 +36,7 @@ pub mod remote;
 pub mod selinux;
 pub use kernel_param::Param;
 pub mod utils;
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 #[cfg(all(
     feature = "cloud-hypervisor",
@@ -48,7 +48,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use hypervisor_persist::HypervisorState;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
-use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+use kata_types::config::hypervisor::{
+    Hypervisor as HypervisorConfig, RootlessUser, MAX_NETWORK_QUEUES,
+};
 
 pub use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 
@@ -143,17 +145,6 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     ) -> Result<()>;
     async fn start_vm(&self, timeout: i32) -> Result<()>;
     async fn stop_vm(&self) -> Result<()>;
-    /// Stop QEMU and wait up to `timeout` for the process to be reaped.
-    ///
-    /// Used on `sandbox.start()` failure so tap FDs are released before
-    /// `release_network()` and a CreateContainer retry (fix12 / #13574).
-    /// Default: same as `stop_vm` (non-blocking) for non-QEMU hypervisors.
-    /// QEMU overrides this with a bounded join on the OS-thread reaper.
-    /// Do NOT use this for Shutdown — large TDX reclaim can exceed any
-    /// reasonable RPC budget (fix9).
-    async fn stop_vm_for_start_fail(&self, _timeout: std::time::Duration) -> Result<()> {
-        self.stop_vm().await
-    }
     async fn wait_vm(&self) -> Result<i32>;
     async fn pause_vm(&self) -> Result<()>;
     async fn save_vm(&self) -> Result<()>;
@@ -170,6 +161,11 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn get_agent_socket(&self) -> Result<String>;
     async fn disconnect(&self);
     async fn hypervisor_config(&self) -> HypervisorConfig;
+    /// Queue-pair limit applied before endpoint creation.
+    /// Backends may override this with a stricter limit.
+    async fn network_queue_limit(&self) -> usize {
+        MAX_NETWORK_QUEUES as usize
+    }
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds>;
     async fn get_pids(&self) -> Result<Vec<u32>>;
     async fn get_vmm_master_tid(&self) -> Result<u32>;
@@ -184,6 +180,19 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn set_guest_memory_block_size(&self, size: u32);
     async fn guest_memory_block_size(&self) -> u32;
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)>;
+
+    async fn set_rootless_user(&self, _user: RootlessUser) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "updating the rootless user is not supported for this hypervisor"
+        ))
+    }
+
+    /// Return the host Unix socket used by this VMM for TDX quote generation.
+    /// A VMM that uses another transport, or does not support guest quote
+    /// generation, returns `None`.
+    async fn tdx_quote_socket_path(&self, _config: &TdxConfig) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
 
     /// Resolve the in-guest PCIe path for a cold-plugged physical-endpoint VF
     /// by querying QMP (query-pci + device search by QEMU device ID).
