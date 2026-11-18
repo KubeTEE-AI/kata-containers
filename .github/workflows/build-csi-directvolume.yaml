@@ -47,6 +47,43 @@ jobs:
           grep -n 'publishDevicePath' pkg/directvolume/nodeserver.go
           grep -n 'backingFile' pkg/directvolume/nodeserver.go
           test "$(grep -c 'Options:    options' pkg/directvolume/nodeserver.go)" = 0
+      - name: Verify restart recovery regression test catches pre-fix behavior
+        env:
+          BASE_COMMIT: 8eb0307e558800b97a5f041f73c29e7d4c7c897a
+        run: |
+          set -eu
+          cp pkg/directvolume/nodeserver.go /tmp/recovered-nodeserver.go
+          git show "$BASE_COMMIT:src/tools/csi-kata-directvolume/pkg/directvolume/nodeserver.go" > pkg/directvolume/nodeserver.go
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('pkg/directvolume/nodeserver.go')
+          s = p.read_text()
+          if 'kata-containers/csi-kata-directvolume/pkg/state' not in s:
+              s = s.replace(
+                  '"kata-containers/csi-kata-directvolume/pkg/spdkrpc"',
+                  '"kata-containers/csi-kata-directvolume/pkg/spdkrpc"\n\t"kata-containers/csi-kata-directvolume/pkg/state"',
+                  1,
+              )
+          marker = '\nfunc (dv *directVolume) NodeUnpublishVolume'
+          _, after = s.split(marker, 1)
+          helper = '''
+          // publishDevicePath reads the backing device from persistent state.
+          // Without its implementation, its zero return reopens the restart bug.
+          func (dv *directVolume) publishDevicePath(vol state.Volume, volumeCtx map[string]string) (string, error) {
+              return "", nil
+          }
+          '''
+          s = s.replace(marker, helper + marker, 1)
+          p.write_text(s)
+          PY
+          if go test ./pkg/directvolume -run '^TestPublishDevicePathAfterRestart$' -count=1; then
+            echo 'The regression test passed without recovery; it did not detect the bug.' >&2
+            exit 1
+          else
+            echo 'Expected failure reproduced without recovery: publish method is absent.'
+          fi
+          cp /tmp/recovered-nodeserver.go pkg/directvolume/nodeserver.go
+          test -z "$(git status --short)"
       - name: Test CSI driver
         run: go test ./...
       - name: Build statically linked Linux CSI binary
@@ -79,6 +116,23 @@ jobs:
             ''|*[!A-Za-z0-9_.-]*) echo 'Invalid or missing image version' >&2; exit 1 ;;
           esac
           printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: src/tools/csi-kata-directvolume/go.mod
+          cache-dependency-path: src/tools/csi-kata-directvolume/go.sum
+      - name: Build static amd64 CSI binary for image
+        working-directory: src/tools/csi-kata-directvolume
+        env:
+          DRIVER_VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -trimpath \
+            -ldflags "-X main.version=${DRIVER_VERSION} -extldflags '-static'" \
+            -o bin/directvolplugin ./cmd/directvolplugin
+          test -x bin/directvolplugin
+          file bin/directvolplugin
+          output="$(bin/directvolplugin --version 2>&1)"
+          printf '%s\n' "$output"
+          grep -F -- "$DRIVER_VERSION" <<< "$output"
       - uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v4
         with:
           registry: ${{ env.REGISTRY }}
