@@ -1,0 +1,117 @@
+name: Build KubeTEE CSI DirectVolume
+
+on:
+  push:
+    paths:
+      - 'src/tools/csi-kata-directvolume/**'
+      - '.github/workflows/build-csi-directvolume.yaml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New immutable KubeTEE CSI driver release tag (for example 4.4.0-kubetee.1)'
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kubetee-ai/kata-directvolume
+
+jobs:
+  test:
+    name: Linux CSI unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src/tools/csi-kata-directvolume
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: src/tools/csi-kata-directvolume/go.mod
+          cache-dependency-path: src/tools/csi-kata-directvolume/go.sum
+      - name: Verify candidate contains no conflict markers
+        run: |
+          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- .; then
+            echo 'Unresolved merge marker in source' >&2
+            exit 1
+          fi
+      - name: Verify direct-volume lifecycle fix
+        run: |
+          grep -n 'RemoveDirectBlockDevice(volId, dv.config.StoragePath)' pkg/directvolume/controllerserver.go
+          grep -n 'Options:    nil' pkg/directvolume/nodeserver.go
+          grep -n 'publishDevicePath' pkg/directvolume/nodeserver.go
+          grep -n 'backingFile' pkg/directvolume/nodeserver.go
+          test "$(grep -c 'Options:    options' pkg/directvolume/nodeserver.go)" = 0
+      - name: Test CSI driver
+        run: go test ./...
+      - name: Build statically linked Linux CSI binary
+        run: CGO_ENABLED=0 go build -trimpath -o bin/directvolplugin ./cmd/directvolplugin
+
+  build-and-push:
+    name: Publish immutable CSI image
+    needs: test
+    if: github.event_name == 'push' || inputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set immutable image tag
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = 'push' ]; then
+            VERSION="4.4.0-pr13187-13185-restart-recovery-${GITHUB_SHA:0:12}"
+          fi
+          case "$VERSION" in
+            ''|*[!A-Za-z0-9_.-]*) echo 'Invalid or missing image version' >&2; exit 1 ;;
+          esac
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the CSI image only
+        id: push
+        uses: docker/build-push-action@562e51947939164e4fe808a6eab5101977e509e0 # master
+        with:
+          context: src/tools/csi-kata-directvolume
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.version }}
+      - name: Record source, run, tag, and digest provenance
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAG_NAME: ${{ steps.tag.outputs.version }}
+        run: |
+          test "${DIGEST#sha256:}" != "$DIGEST"
+          {
+            printf 'Source: `%s`\n\n' "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+            printf 'Workflow run: `%s`\n\n' "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            printf 'Image: `%s/%s:%s@%s`\n' "${{ env.REGISTRY }}" "${{ env.IMAGE_NAME }}" "$TAG_NAME" "$DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Verify public immutable image digest
+        run: docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
