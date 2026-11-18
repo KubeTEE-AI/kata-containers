@@ -49,13 +49,13 @@ jobs:
           test "$(grep -c 'Options:    options' pkg/directvolume/nodeserver.go)" = 0
       - name: Verify restart recovery regression test catches pre-fix behavior
         env:
-          BASE_COMMIT: cf390246f97fe530ef219ea4110a917e40ef21c3fb
+          BASE_COMMIT: 156d0ad9335711582fa715b7da590277a22f6010
         run: |
           set -eu
           cp pkg/directvolume/nodeserver.go /tmp/recovered-nodeserver.go
-          curl --fail --silent --show-error --location \
-            "https://raw.githubusercontent.com/kata-containers/kata-containers/${BASE_COMMIT}/src/tools/csi-kata-directvolume/pkg/directvolume/nodeserver.go" \
-            --output pkg/directvolume/nodeserver.go
+          git fetch --no-tags --depth=1 https://github.com/kata-containers/kata-containers.git "$BASE_COMMIT"
+          git show "$BASE_COMMIT:src/tools/csi-kata-directvolume/pkg/directvolume/nodeserver.go" > /tmp/baseline-nodeserver.go
+          cp /tmp/baseline-nodeserver.go pkg/directvolume/nodeserver.go
           python3 - <<'PY'
           from pathlib import Path
           p = Path('pkg/directvolume/nodeserver.go')
@@ -70,6 +70,8 @@ jobs:
                   1,
               )
           marker = '\nfunc (dv *directVolume) NodeUnpublishVolume'
+          if not s.startswith('//') or marker not in s:
+              raise SystemExit('Unexpected nodeserver baseline shape')
           _, after = s.split(marker, 1)
           helper = '''
           // publishDevicePath reads the backing device from persistent state.
@@ -88,9 +90,11 @@ jobs:
             echo 'Expected failure reproduced with the original device-cache lookup.'
           fi
           cp /tmp/recovered-nodeserver.go pkg/directvolume/nodeserver.go
-          test -z "$(git status --short)"
+          git diff --exit-code -- .
       - name: Test CSI driver
         run: go test -v ./...
+      - name: List assertions actually exercised on Linux
+        run: go test -list 'Test.*' ./...
       - name: Build statically linked Linux CSI binary
         run: CGO_ENABLED=0 go build -trimpath -o bin/directvolplugin ./cmd/directvolplugin
 
@@ -141,8 +145,8 @@ jobs:
       - uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v4
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: pamanseau
+          password: ${{ secrets.GHCR_TOKEN }}
       - name: Build and push the CSI image only
         id: push
         uses: docker/build-push-action@562e51947939164e4fe808a6eab5101977e509e0 # master
