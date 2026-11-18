@@ -27,9 +27,10 @@ jobs:
       run:
         working-directory: src/tools/csi-kata-directvolume
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      -         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: src/tools/csi-kata-directvolume/go.mod
@@ -49,11 +50,13 @@ jobs:
           test "$(grep -c 'Options:    options' pkg/directvolume/nodeserver.go)" = 0
       - name: Verify restart recovery regression test catches pre-fix behavior
         env:
-          BASE_COMMIT: 8eb0307e558800b97a5f041f73c29e7d4c7c897a
+          BASE_COMMIT: cf390246f97fe530ef219ea4110a917e40ef21c3fb
         run: |
           set -eu
           cp pkg/directvolume/nodeserver.go /tmp/recovered-nodeserver.go
-          git show "$BASE_COMMIT:src/tools/csi-kata-directvolume/pkg/directvolume/nodeserver.go" > pkg/directvolume/nodeserver.go
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/KubeTEE-AI/kata-containers/${BASE_COMMIT}/src/tools/csi-kata-directvolume/pkg/directvolume/nodeserver.go" \
+            --output pkg/directvolume/nodeserver.go
           python3 - <<'PY'
           from pathlib import Path
           p = Path('pkg/directvolume/nodeserver.go')
@@ -76,7 +79,7 @@ jobs:
           s = s.replace(marker, helper + marker, 1)
           p.write_text(s)
           PY
-          if go test ./pkg/directvolume -run '^TestPublishDevicePathAfterRestart$' -count=1; then
+          if timeout 90s go test ./pkg/directvolume -run '^TestPublishDevicePathAfterRestart$' -count=1; then
             echo 'The regression test passed without recovery; it did not detect the bug.' >&2
             exit 1
           else
