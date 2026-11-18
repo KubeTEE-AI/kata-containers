@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/golang/protobuf/ptypes/wrappers"
@@ -50,8 +51,10 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 		topologies = append(topologies, &csi.Topology{Segments: map[string]string{TopologyKeyNode: dv.config.NodeID}})
 	}
 
-	volumeCtx := make(map[string]string)
-	volumeCtx[utils.IsDirectVolume] = "False"
+	volumeCtx := map[string]string{
+		utils.IsDirectVolume:   "False",
+		utils.DirectVolumeName: req.GetName(),
+	}
 
 	for key, value := range req.GetParameters() {
 		switch strings.ToLower(key) {
@@ -65,6 +68,10 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 		default:
 			continue
 		}
+	}
+	if volumeCtx[utils.IsDirectVolume] != "True" {
+		return nil, status.Errorf(codes.InvalidArgument, "parameter %s must be %q or %q",
+			utils.KataContainersDirectVolumeType, utils.DirectVolumeTypeName, utils.SpdkVolumeTypeName)
 	}
 
 	contentSrc := req.GetVolumeContentSource()
@@ -91,8 +98,6 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 			}
 		}
 
-<<<<<<< HEAD
-=======
 		// A retried CreateVolume may follow a failure between recording the
 		// volume and allocating its backing device, so allocate again.
 		if volumeCtx[utils.KataContainersDirectVolumeType] != utils.SpdkVolumeTypeName {
@@ -103,11 +108,10 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 
 		volumeCtx[utils.CapacityInBytes] = fmt.Sprintf("%d", exVol.VolSize)
 
->>>>>>> 8eb0307e5 (csi-kata-directvolume: fix a constant name)
 		return &csi.CreateVolumeResponse{
 			Volume: &csi.Volume{
 				VolumeId:           exVol.VolID,
-				CapacityBytes:      int64(exVol.VolSize),
+				CapacityBytes:      exVol.VolSize,
 				VolumeContext:      volumeCtx,
 				ContentSource:      contentSrc,
 				AccessibleTopology: topologies,
@@ -132,6 +136,18 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 			return nil, err
 		}
 		klog.Infof("created volume %s at path %s", vol.VolID, vol.VolPath)
+
+		if err := dv.ensureDirectBackingDevice(vol); err != nil {
+			klog.Errorf("failed to allocate backing device for volume %s: %v", volumeID, err)
+			if rmErr := utils.RemoveDirectBlockDevice(volumeID, dv.config.StoragePath); rmErr != nil {
+				klog.Warningf("failed to remove backing device of volume %s: %v", volumeID, rmErr)
+			}
+			if delErr := dv.deleteVolume(volumeID); delErr != nil {
+				klog.Warningf("failed to delete volume %s: %v", volumeID, delErr)
+			}
+			return nil, err
+		}
+		klog.Infof("allocated backing device %s for volume %s", vol.Metadata["backingFile"], volumeID)
 	}
 
 	if contentSrc != nil {
@@ -157,7 +173,6 @@ func (dv *directVolume) CreateVolume(ctx context.Context, req *csi.CreateVolumeR
 		klog.Infof("successfully populated volume %s", vol.VolID)
 	}
 
-	volumeCtx[utils.DirectVolumeName] = req.GetName()
 	volumeCtx[utils.CapacityInBytes] = fmt.Sprintf("%d", capacity)
 
 	return &csi.CreateVolumeResponse{
@@ -193,6 +208,11 @@ func (dv *directVolume) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeR
 
 	vol, err := dv.state.GetVolumeByID(volId)
 	if err != nil {
+		// The state may have been lost while the backing device survived,
+		// so release the storage path of the volume regardless.
+		if err := utils.RemoveDirectBlockDevice(volId, dv.config.StoragePath); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to remove backing device of volume %s: %v", volId, err)
+		}
 		klog.Warningf("Volume ID %s not found: might have already deleted", volId)
 		return &csi.DeleteVolumeResponse{}, nil
 	}
@@ -231,6 +251,13 @@ func (dv *directVolume) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeR
 				klog.Infof("Removed backing file %s for volume %s", backingFile, volId)
 			}
 		}
+	} else {
+		// The backing device is allocated by CreateVolume and survives
+		// NodeUnstageVolume, so DeleteVolume is where it is released.
+		if err := utils.RemoveDirectBlockDevice(volId, dv.config.StoragePath); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to remove backing device of volume %s: %v", volId, err)
+		}
+		klog.Infof("Removed backing device of volume %s", volId)
 	}
 
 	if err := dv.deleteVolume(volId); err != nil {
@@ -239,6 +266,23 @@ func (dv *directVolume) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeR
 	klog.Infof("volume %v successfully deleted", volId)
 
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// ensureDirectBackingDevice allocates the raw disk backing a directvol volume
+// and records its path in the volume state. It is idempotent.
+func (dv *directVolume) ensureDirectBackingDevice(vol *state.Volume) error {
+	devicePath, err := utils.CreateDirectBlockDevice(vol.VolID, strconv.FormatInt(vol.VolSize, 10), dv.config.StoragePath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to allocate backing device for volume %s: %v", vol.VolID, err)
+	}
+
+	if vol.Metadata == nil {
+		vol.Metadata = map[string]string{}
+	}
+	vol.Metadata["type"] = utils.DirectVolumeTypeName
+	vol.Metadata["backingFile"] = *devicePath
+
+	return dv.state.UpdateVolume(*vol)
 }
 
 func (dv *directVolume) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
