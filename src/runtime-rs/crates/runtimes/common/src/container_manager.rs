@@ -37,4 +37,57 @@ pub trait ContainerManager: Send + Sync {
     async fn pid(&self) -> Result<PID>;
     async fn need_shutdown_sandbox(&self, req: &ShutdownRequest) -> bool;
     async fn is_sandbox_container(&self, process_id: &ContainerProcess) -> bool;
+    async fn has_guest_container(&self, process_id: &ContainerProcess) -> bool;
+    async fn guest_map_is_empty(&self) -> bool;
+}
+
+/// Leftover Unknown init: kubelet StopContainer of a CRI id that never
+/// entered the shim map (e.g. `fetch-certs` after a node reboot). Wait
+/// then errors and never reaches sandbox-id Kill. An empty guest map
+/// (no workload containers; the pause/sandbox entry does not count —
+/// fix21) means only the pause/QEMU remain — safe to stop. Do **not**
+/// stop when another guest container is still in the map (init
+/// CrashLoop retry).
+pub fn should_stop_vm_on_missing_task(
+    is_sandbox: bool,
+    is_container_process: bool,
+    has_guest_container: bool,
+    guest_map_is_empty: bool,
+) -> bool {
+    if is_sandbox {
+        return true;
+    }
+
+    is_container_process && !has_guest_container && guest_map_is_empty
+}
+
+#[cfg(test)]
+mod tests_missing_task {
+    use super::should_stop_vm_on_missing_task;
+
+    #[rstest::rstest]
+    #[case::sandbox(true, true, false, false, true)]
+    #[case::sandbox_exec(false, false, false, false, false)]
+    #[case::unknown_init_no_guests(false, true, false, true, true)]
+    #[case::unknown_init_with_sibling(false, true, false, false, false)]
+    #[case::known_init_without_sibling(false, true, true, true, false)]
+    #[case::unknown_init_with_guest_entry(false, true, true, false, false)]
+    #[case::unknown_exec(false, false, false, true, false)]
+    fn only_stops_missing_task_when_it_owns_the_last_guest(
+        #[case] is_sandbox: bool,
+        #[case] is_container_process: bool,
+        #[case] has_guest_container: bool,
+        #[case] guest_map_is_empty: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            should_stop_vm_on_missing_task(
+                is_sandbox,
+                is_container_process,
+                has_guest_container,
+                guest_map_is_empty
+            ),
+            expected
+        );
+    }
 }
