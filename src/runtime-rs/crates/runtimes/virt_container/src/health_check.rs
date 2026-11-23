@@ -6,13 +6,24 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent::Agent;
 use anyhow::Context;
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::timeout;
 
 /// monitor check interval 30s
 const HEALTH_CHECK_TIMER_INTERVAL: u64 = 30;
+
+/// Bound on the failure-path sandbox stop. `on_failure()` runs the full sandbox
+/// teardown; if any step hangs (e.g. a reconnect to a dead guest transport) the
+/// monitor would otherwise wait forever and never reach the fail-fast exit —
+/// leaving a wedged shim that answers no Task/* RPC and parks the pod in
+/// Terminating indefinitely (reproduced 2026-11-23 on lu-b300-39). Exposing a
+/// leftover VMM is preferable to a wedged shim, and the inner stop_vm is
+/// already bounded to 15s, so this only trips on a genuinely stuck teardown.
+const ON_FAILURE_STOP_BUDGET: Duration = Duration::from_secs(30);
 
 /// version check threshold 5min
 const VERSION_CHECK_THRESHOLD: u64 = 5 * 60 / HEALTH_CHECK_TIMER_INTERVAL;
@@ -95,11 +106,23 @@ impl HealthCheck {
                                     if !keep_abnormal {
                                         // Exiting the shim here would leave an external VMM running.
                                         warn!(sl!(), "stopping the VM of sandbox {}", id);
-                                        if !on_failure().await {
-                                            error!(sl!(), "VM exit was not confirmed, exiting");
-                                            ::std::process::exit(1);
+                                        // Fail fast: bound the stop so a stuck
+                                        // teardown cannot wedge the shim forever.
+                                        match timeout(ON_FAILURE_STOP_BUDGET, on_failure()).await {
+                                            Ok(true) => break,
+                                            Ok(false) => {
+                                                error!(sl!(), "VM exit was not confirmed, exiting");
+                                                ::std::process::exit(1);
+                                            }
+                                            Err(_) => {
+                                                error!(
+                                                    sl!(),
+                                                    "sandbox stop hung past {:?}, exiting to avoid a wedged shim (VMM may survive)",
+                                                    ON_FAILURE_STOP_BUDGET
+                                                );
+                                                ::std::process::exit(1);
+                                            }
                                         }
-                                        break;
                                     }
                                 } else {
                                     info!(sl!(), "wait to exit {}", id);
