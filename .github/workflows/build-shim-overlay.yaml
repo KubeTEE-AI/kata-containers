@@ -18,11 +18,19 @@
 #    (should_stop_vm_on_missing_task + guest_map_is_empty), reproduced 2026-10-23
 #    (graceful delete wedged 105 min on fix11649; healthy shim, QEMU never
 #    signaled; unblocked only by kill -TERM <qemu>).
+#  - vsock-connect-timeout + stop fail-fast / #13746-class teardown wedge:
+#    bound the vsock connect (non-blocking connect(2) + poll(POLLOUT) + SO_ERROR
+#    with a per-attempt dial budget — a connect(2) to a dead guest transport
+#    previously blocked forever in-kernel, leaking blocking-pool threads until
+#    every Task/* RPC timed out) AND bound on_failure() in the runtime keep-alive
+#    monitor so a stuck stop can never wedge the shim past 30s. Reproduced
+#    2026-11-23 on lu-b300-39: shim alive, QEMU zombie, Task/State + Task/Kill
+#    "got error timed out" storm, pod Terminating 2h+, FailedKillPod.
 #  - fix16 / #13641: CONSCIOUSLY DROPPED — not reproduced on 4.3.1 + kernel
 #    7.0.0-39 (the host-fsnotify confounder is fixed in 7.0.0-39). Re-add
 #    only on new evidence.
 #
-# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.4.0-fix11649-t15t16 (NEW tag)
+# Image: ghcr.io/kubetee-ai/kata-deploy-shim-overlay:v4.4.0-fix11649-t15t16-vsocktimeout (NEW tag)
 
 name: build-shim-overlay
 
@@ -48,7 +56,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: kubetee-ai/kata-deploy-shim-overlay
-  SHIM_TAG: v4.4.0-fix11649-t15t16
+  SHIM_TAG: v4.4.0-fix11649-t15t16-vsocktimeout
   # Pin ONE exact toolchain for every step. rust-toolchain.toml only pins
   # `channel = "1.97"` (no patch), so `rustup target add` and `cargo build` can
   # resolve DIFFERENT 1.97.x toolchains — musl rust-std lands in one while the
@@ -86,6 +94,11 @@ jobs:
             src/runtime-rs/crates/runtimes/src/manager.rs | head -5
           grep -n 'guest_map_is_empty' \
             src/runtime-rs/crates/runtimes/virt_container/src/container_manager/manager.rs | head -5
+          echo "== vsock connect bound + stop fail-fast / #13746-class teardown wedge (REQUIRED) =="
+          grep -n 'connect_vsock_bounded\|bounded_dial_timeout_ms' \
+            src/runtime-rs/crates/agent/src/sock/vsock.rs | head -5
+          grep -n 'ON_FAILURE_STOP_BUDGET' \
+            src/runtime-rs/crates/runtimes/virt_container/src/health_check.rs | head -5
           git log --oneline -3
 
       - name: Install build dependencies (upstream shim-v2 recipe + our extras)
